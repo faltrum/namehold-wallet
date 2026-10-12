@@ -19,6 +19,11 @@ pub enum AppError {
     Crypto(String),
     #[error("Node RPC error: {0}")]
     Rpc(String),
+    #[error(
+        "The selected node engine is hsrd, but wallet operations are not available yet; \
+         use hsd or wait for the hsrd wallet API adapter"
+    )]
+    UnsupportedNodeEngine,
     /// hsd's own JSON-RPC error: the node read the call and refused it (bweb's
     /// HTTP 200 envelope with a numeric `code`). Made only by
     /// `NodeRpcClient::call`; every other node failure — a proxy's page, a

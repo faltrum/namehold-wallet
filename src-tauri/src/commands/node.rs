@@ -11,7 +11,7 @@ use crate::commands::active_profile::{active_profile_network, active_profile_net
 use crate::db;
 use crate::error::AppError;
 use crate::noncustodial::network::Network;
-use crate::noncustodial::rpc::{ChainSource, NodeRpcClient};
+use crate::noncustodial::rpc::{resolve_node_engine, ChainSource, NodeEngine, NodeRpcClient};
 use crate::AppState;
 use std::process::{Command, Stdio};
 use tauri::State;
@@ -60,6 +60,20 @@ pub(crate) fn hsd_candidates() -> Vec<String> {
     candidates
 }
 
+/// Common hsrd install locations to probe.
+#[cfg_attr(coverage_nightly, coverage(off))]
+pub(crate) fn hsrd_candidates() -> Vec<String> {
+    let mut candidates = vec![
+        "/opt/homebrew/bin/hsrd".to_string(),
+        "/usr/local/bin/hsrd".to_string(),
+    ];
+    if let Ok(home) = std::env::var("HOME") {
+        candidates.push(format!("{home}/.local/bin/hsrd"));
+        candidates.push(format!("{home}/.cargo/bin/hsrd"));
+    }
+    candidates
+}
+
 /// Locate the hsd binary: an explicit `hsd_path` override first, then common
 /// install dirs, then `which hsd`, then the bare name (resolved via PATH).
 // IO shell: the `which hsd` fallback depends on the system PATH and cannot be
@@ -88,6 +102,45 @@ fn configured_hsd_path(state: &AppState) -> Option<String> {
         .get("hsd_path")
         .map(|s| s.trim().to_string())
         .filter(|s| !s.is_empty())
+}
+
+fn configured_node_engine(state: &AppState) -> Result<NodeEngine, AppError> {
+    let db = state.db.lock().map_err(|e| AppError::Lock(e.to_string()))?;
+    let settings = db::queries::get_settings(&db)?;
+    Ok(resolve_node_engine(&settings))
+}
+
+fn configured_node_path(state: &AppState, engine: NodeEngine) -> Option<String> {
+    let db = state.db.lock().ok()?;
+    let settings = db::queries::get_settings(&db).ok()?;
+    let key = match engine {
+        NodeEngine::Hsd => "hsd_path",
+        NodeEngine::Hsrd => "hsrd_path",
+    };
+    settings
+        .get(key)
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+}
+
+fn find_node_binary(engine: NodeEngine, override_path: Option<&str>) -> String {
+    let candidates = match engine {
+        NodeEngine::Hsd => hsd_candidates(),
+        NodeEngine::Hsrd => hsrd_candidates(),
+    };
+    if let Some(found) = pick_hsd_path(override_path, &candidates) {
+        return found;
+    }
+    let name = engine.as_str();
+    if let Ok(output) = Command::new("which").arg(name).output() {
+        if output.status.success() {
+            let path = String::from_utf8_lossy(&output.stdout).trim().to_string();
+            if !path.is_empty() {
+                return path;
+            }
+        }
+    }
+    name.to_string()
 }
 
 /// `hsd --version`, if the binary runs.
@@ -241,6 +294,11 @@ pub(crate) async fn probe_and_update(state: &AppState) -> bool {
 /// since process liveness is not proof the RPC server is up. Carries sync
 /// progress so the UI can show how far the node has caught up.
 async fn probe_node(state: &AppState) -> Option<NodeProbe> {
+    let engine = configured_node_engine(state).ok()?;
+    probe_node_with_engine(state, engine).await
+}
+
+async fn probe_node_with_engine(state: &AppState, engine: NodeEngine) -> Option<NodeProbe> {
     // Clone the settings map under the lock, then drop it — never hold the db
     // mutex across the await.
     // Per-profile node override routing (ADR-001): probe the active profile's
@@ -250,6 +308,24 @@ async fn probe_node(state: &AppState) -> Option<NodeProbe> {
     // is the whole answer; a profile whose own config will not resolve is a
     // configuration error, and this probe reports "cannot tell" rather than
     // quietly describing a node the profile does not use.
+    if engine == NodeEngine::Hsrd {
+        let (url, authorization) = {
+            let db = state.db.lock().ok()?;
+            let settings = db::queries::get_settings(&db).ok()?;
+            (
+                settings
+                    .get("node_rpc_url")
+                    .cloned()
+                    .unwrap_or_else(|| "http://127.0.0.1:12037".to_string()),
+                settings
+                    .get("hsrd_authorization_header")
+                    .cloned()
+                    .unwrap_or_default(),
+            )
+        };
+        return probe_hsrd(&url, &authorization).await;
+    }
+
     let client = {
         let db = state.db.lock().ok()?;
         match db::queries::get_active_profile_id(&db) {
@@ -260,6 +336,7 @@ async fn probe_node(state: &AppState) -> Option<NodeProbe> {
                 let settings = db::queries::get_settings(&db).ok()?;
                 NodeRpcClient::from_settings(&settings)
             }
+
             Ok(profile_id) => NodeRpcClient::for_profile(&db, &profile_id).ok()?,
             Err(_) => return None,
         }
@@ -276,15 +353,80 @@ async fn probe_node(state: &AppState) -> Option<NodeProbe> {
         })
 }
 
+async fn probe_hsrd(url: &str, authorization: &str) -> Option<NodeProbe> {
+    let client = reqwest::Client::builder()
+        .timeout(Duration::from_secs(5))
+        .build()
+        .ok()?;
+    let base = url.trim_end_matches('/');
+    let mut request = client.get(format!("{base}/api/v1/status"));
+    if !authorization.is_empty() {
+        request = request.header(reqwest::header::AUTHORIZATION, authorization);
+    }
+    let status_body = request
+        .send()
+        .await
+        .ok()?
+        .json::<serde_json::Value>()
+        .await
+        .ok()?;
+
+    let mut sync_request = client.get(format!("{base}/api/v1/sync"));
+    if !authorization.is_empty() {
+        sync_request = sync_request.header(reqwest::header::AUTHORIZATION, authorization);
+    }
+    let sync_body = sync_request
+        .send()
+        .await
+        .ok()?
+        .json::<serde_json::Value>()
+        .await
+        .ok()
+        .unwrap_or(serde_json::Value::Null);
+
+    let number = |body: &serde_json::Value, keys: &[&str]| -> Option<i64> {
+        keys.iter()
+            .find_map(|key| body.get(*key).and_then(|v| v.as_i64()))
+    };
+    let progress = ["verification_progress", "progress"]
+        .iter()
+        .find_map(|key| sync_body.get(*key).and_then(|v| v.as_f64()));
+    let syncing = sync_body.get("syncing").and_then(|v| v.as_bool());
+    let height = number(&status_body, &["height", "tip_height", "best_height"])?;
+    let headers = number(
+        &sync_body,
+        &["target_height", "headers", "best_header_height"],
+    );
+    let chain = status_body
+        .get("network")
+        .or_else(|| status_body.get("chain"))
+        .and_then(|v| v.as_str())
+        .map(str::to_string);
+
+    Some(NodeProbe {
+        height,
+        verification_progress: progress.or_else(|| {
+            if syncing == Some(false) {
+                Some(1.0)
+            } else {
+                None
+            }
+        }),
+        headers,
+        chain,
+    })
+}
+
 /// Node status for the Settings UI + status strip. `connected` (RPC answers) is
 /// the authoritative signal; `process_alive` only reflects the child we spawned.
 #[tauri::command]
 pub async fn node_status(state: State<'_, AppState>) -> Result<serde_json::Value, AppError> {
-    let binary = find_hsd_binary(configured_hsd_path(&state).as_deref());
+    let engine = configured_node_engine(&state)?;
+    let binary = find_node_binary(engine, configured_node_path(&state, engine).as_deref());
     let version = get_hsd_version(&binary);
     let data_dir = resolve_data_dir(&state)?;
     let process_alive = is_running(&state)?;
-    let probe = probe_node(&state).await;
+    let probe = probe_node_with_engine(&state, engine).await;
     // Keep the shared liveness flag in sync — the tray reads this to decide
     // whether to show "Running" or "Stopped" without doing its own RPC probe.
     state
@@ -300,7 +442,7 @@ pub async fn node_status(state: State<'_, AppState>) -> Result<serde_json::Value
     // persists past `start_hsd`'s short watch window), so a failed start never
     // shows as a silent "Starting…/Stopped".
     let err = if probe.is_none() {
-        node_start_error(&data_dir)
+        node_start_error_for_engine(&data_dir, engine)
     } else {
         None
     };
@@ -366,6 +508,7 @@ pub async fn node_status(state: State<'_, AppState>) -> Result<serde_json::Value
         "read_source": read_source,
         // Node operating mode: "full" or "spv".
         "node_mode": node_mode.as_str(),
+        "node_engine": engine.as_str(),
     }))
 }
 
@@ -410,7 +553,11 @@ pub(crate) fn is_fatal_startup_line(line: &str) -> bool {
 /// look like an error. The index-mismatch case (hsd can't retro-enable an index)
 /// gets specific guidance and flags the UI to offer a one-click re-sync.
 pub(crate) fn node_start_error(data_dir: &str) -> Option<(String, bool)> {
-    let log_path = std::path::Path::new(data_dir).join("namehold-hsd.log");
+    node_start_error_for_engine(data_dir, NodeEngine::Hsd)
+}
+
+fn node_start_error_for_engine(data_dir: &str, engine: NodeEngine) -> Option<(String, bool)> {
+    let log_path = std::path::Path::new(data_dir).join(format!("namehold-{}.log", engine.as_str()));
     let body = std::fs::read_to_string(&log_path).ok()?;
     let body = body.trim();
     if body.is_empty() {
@@ -427,7 +574,7 @@ pub(crate) fn node_start_error(data_dir: &str) -> Option<(String, bool)> {
     }
     let tail: Vec<&str> = body.lines().rev().take(8).collect();
     let tail = tail.into_iter().rev().collect::<Vec<_>>().join("\n");
-    if body.contains("retroactively") && body.contains("indexing") {
+    if engine == NodeEngine::Hsd && body.contains("retroactively") && body.contains("indexing") {
         Some((
             format!(
                 "This chain's indexes don't match what the wallet needs, and hsd can't \
@@ -437,7 +584,10 @@ pub(crate) fn node_start_error(data_dir: &str) -> Option<(String, bool)> {
             true,
         ))
     } else {
-        Some((format!("hsd failed to start:\n\n{tail}"), false))
+        Some((
+            format!("{} failed to start:\n\n{tail}", engine.as_str()),
+            false,
+        ))
     }
 }
 
@@ -470,6 +620,7 @@ pub async fn start_hsd(state: State<'_, AppState>) -> Result<serde_json::Value, 
                 .to_string(),
         )
     })?;
+    let engine = configured_node_engine(&state)?;
 
     // A node may already be running (e.g. one started in a previous app session,
     // or the user's own). If its RPC already answers AND it is on the right
@@ -477,7 +628,7 @@ pub async fn start_hsd(state: State<'_, AppState>) -> Result<serde_json::Value, 
     // would only collide on the data-dir lock. A chain mismatch is refused
     // rather than silently adopted: a wallet talking to the wrong chain would
     // treat unrelated coins as its own.
-    if let Some(probe) = probe_node(&state).await {
+    if let Some(probe) = probe_node_with_engine(&state, engine).await {
         guard_probe_network(network, probe.chain.as_deref())?;
         state
             .node_rpc_alive
@@ -511,13 +662,17 @@ pub async fn start_hsd(state: State<'_, AppState>) -> Result<serde_json::Value, 
     //
     // The same resolution decides whether realign may touch the URL, so both
     // are taken under one lock.
-    let (api_key, node_mode) = {
+    let (api_key, hsrd_authorization, node_mode) = {
         let db = state.db.lock().map_err(|e| AppError::Lock(e.to_string()))?;
         let profile_id = db::queries::get_active_profile_id(&db)?;
         let effective =
             crate::noncustodial::node_config::effective_node_config_for_profile(&db, &profile_id)?;
         let settings = db::queries::get_settings(&db)?;
         let node_mode = crate::noncustodial::rpc::resolve_node_mode(&settings);
+        let hsrd_authorization = settings
+            .get("hsrd_authorization_header")
+            .cloned()
+            .unwrap_or_default();
 
         // hsd will listen on this network's RPC port, but a globally seeded
         // `node_rpc_url` keeps whatever it was given — the mainnet 12037. Left
@@ -538,13 +693,20 @@ pub async fn start_hsd(state: State<'_, AppState>) -> Result<serde_json::Value, 
                 db::queries::set_setting(&db, "node_rpc_url", &fixed)?;
             }
         }
-        (effective.node_rpc_api_key, node_mode)
+        (effective.node_rpc_api_key, hsrd_authorization, node_mode)
     };
+
+    if engine == NodeEngine::Hsrd && hsrd_authorization.trim().is_empty() {
+        return Err(AppError::Other(
+            "hsrd requires an Authorization header to expose /api/v1/wallet; configure hsrd_authorization_header before starting the node"
+                .to_string(),
+        ));
+    }
 
     std::fs::create_dir_all(&data_dir)
         .map_err(|e| AppError::Other(format!("cannot create data dir {data_dir}: {e}")))?;
 
-    let binary = find_hsd_binary(configured_hsd_path(&state).as_deref());
+    let binary = find_node_binary(engine, configured_node_path(&state, engine).as_deref());
 
     // Refuse to spawn a too-old hsd: it may silently lack the index flags or
     // RPC fields this wallet relies on. If the version can't be determined at
@@ -553,24 +715,26 @@ pub async fn start_hsd(state: State<'_, AppState>) -> Result<serde_json::Value, 
     // error, and unparseable-but-present output is more likely a future hsd
     // version's format changing than an actual incompatibility, so we warn and
     // proceed rather than lock users out.
-    if let Some(raw) = get_hsd_version(&binary) {
-        match parse_hsd_version(&raw) {
-            Some(found) if found < HSD_MIN_VERSION => {
-                return Err(AppError::Other(format!(
-                    "hsd {} (found at {binary}) is older than the minimum supported \
+    if engine == NodeEngine::Hsd {
+        if let Some(raw) = get_hsd_version(&binary) {
+            match parse_hsd_version(&raw) {
+                Some(found) if found < HSD_MIN_VERSION => {
+                    return Err(AppError::Other(format!(
+                        "hsd {} (found at {binary}) is older than the minimum supported \
                      version {}. This wallet relies on index flags and RPC behavior \
                      introduced in hsd 8.x. Upgrade hsd — e.g. `npm install -g hsd@latest` \
                      or `brew upgrade hsd` — then try again.",
-                    raw.trim(),
-                    format_version(HSD_MIN_VERSION),
-                )));
-            }
-            Some(_) => {}
-            None => {
-                eprintln!(
-                    "warning: could not parse hsd version output ({raw:?}) from {binary}; \
+                        raw.trim(),
+                        format_version(HSD_MIN_VERSION),
+                    )));
+                }
+                Some(_) => {}
+                None => {
+                    eprintln!(
+                        "warning: could not parse hsd version output ({raw:?}) from {binary}; \
                      skipping minimum-version check"
-                );
+                    );
+                }
             }
         }
     }
@@ -584,10 +748,44 @@ pub async fn start_hsd(state: State<'_, AppState>) -> Result<serde_json::Value, 
     // (`<base>/regtest/regtest`); this keeps hsd's chain root identical to the
     // app's `data_dir` (`<base>/regtest`), which the log, RPC, and migration all
     // assume. Mainnet's base *is* its data dir, so this is a no-op there.
-    let spawn_prefix = resolve_configured_base(&state)?;
-    cmd.arg(format!("--prefix={spawn_prefix}"));
-    if !api_key.trim().is_empty() {
-        cmd.arg(format!("--api-key={}", api_key.trim()));
+    if engine == NodeEngine::Hsd {
+        let spawn_prefix = resolve_configured_base(&state)?;
+        cmd.arg(format!("--prefix={spawn_prefix}"));
+        if !api_key.trim().is_empty() {
+            cmd.arg(format!("--api-key={}", api_key.trim()));
+        }
+    } else {
+        let hsrd_network = match network {
+            Network::Main => "mainnet",
+            Network::Testnet => "testnet",
+            Network::Regtest => "regtest",
+            Network::Simnet => "simnet",
+        };
+        cmd.arg("--network").arg(hsrd_network);
+        cmd.arg("--data-dir").arg(&data_dir);
+        cmd.arg("--rpc-bind").arg("127.0.0.1:12037");
+        cmd.arg("--wallet-index");
+        if !hsrd_authorization.trim().is_empty() {
+            let auth_path = std::path::Path::new(&data_dir).join("namehold-hsrd.authorization");
+            std::fs::write(&auth_path, hsrd_authorization.as_bytes()).map_err(|e| {
+                AppError::Other(format!(
+                    "cannot write hsrd authorization file {}: {e}",
+                    auth_path.display()
+                ))
+            })?;
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                std::fs::set_permissions(&auth_path, std::fs::Permissions::from_mode(0o600))
+                    .map_err(|e| {
+                        AppError::Other(format!(
+                            "cannot protect hsrd authorization file {}: {e}",
+                            auth_path.display()
+                        ))
+                    })?;
+            }
+            cmd.arg("--rpc-authorization-header-file").arg(auth_path);
+        }
     }
     // The wallet learns its spendable + name-owner coins via `getcoinsbyaddress`
     // (ADDRESS index); `getrawtransaction` (TX index) backs the transaction-history
@@ -597,7 +795,10 @@ pub async fn start_hsd(state: State<'_, AppState>) -> Result<serde_json::Value, 
     // chain (chaindb.js `verifyFlags` throws "Cannot retroactively enable …
     // indexing"). A chain synced without these must be re-synced from genesis with
     // them — there is no in-place reindex.
-    if node_mode.is_spv() {
+    if engine == NodeEngine::Hsrd {
+        // hsrd's wallet-index profile is the only mode supported by the
+        // incremental adapter. SPV remains an hsd-only option for now.
+    } else if node_mode.is_spv() {
         // SPV mode: download only block headers, no address/tx indexing.
         // Faster sync, less disk usage. Data reads fall back to explorer.
         cmd.arg("--spv");
@@ -611,10 +812,13 @@ pub async fn start_hsd(state: State<'_, AppState>) -> Result<serde_json::Value, 
     // regtest-scoped data dirs (repeated `_mainnet-contamination-*` quarantines).
     // `--network=` is honored for every network, so we pass it unconditionally,
     // mainnet included, rather than relying on omission.
-    cmd.arg(format!("--network={}", network.as_str()));
+    if engine == NodeEngine::Hsd {
+        cmd.arg(format!("--network={}", network.as_str()));
+    }
     // Capture hsd's output to a log file so a failed start has a visible reason
     // (port busy, bad data dir, network mismatch) instead of vanishing into null.
-    let log_path = std::path::Path::new(&data_dir).join("namehold-hsd.log");
+    let log_name = format!("namehold-{}.log", engine.as_str());
+    let log_path = std::path::Path::new(&data_dir).join(log_name);
     let log = std::fs::File::create(&log_path)
         .map_err(|e| AppError::Other(format!("cannot open hsd log {}: {e}", log_path.display())))?;
     let log_err = log
@@ -622,9 +826,12 @@ pub async fn start_hsd(state: State<'_, AppState>) -> Result<serde_json::Value, 
         .map_err(|e| AppError::Other(format!("cannot prepare hsd log: {e}")))?;
     cmd.stdout(Stdio::from(log)).stderr(Stdio::from(log_err));
 
-    let child = cmd
-        .spawn()
-        .map_err(|e| AppError::Other(format!("failed to start hsd ({binary}): {e}")))?;
+    let child = cmd.spawn().map_err(|e| {
+        AppError::Other(format!(
+            "failed to start {} ({binary}): {e}",
+            engine.as_str()
+        ))
+    })?;
 
     {
         let mut guard = state
@@ -670,7 +877,7 @@ pub async fn start_hsd(state: State<'_, AppState>) -> Result<serde_json::Value, 
                 return Err(AppError::Other(format!("hsd exited on startup.{tail}")));
             }
         }
-        if let Some(probe) = probe_node(&state).await {
+        if let Some(probe) = probe_node_with_engine(&state, engine).await {
             // The node we spawned answered — confirm it came up on the network we
             // asked for before reporting success. A mismatch here means the data
             // dir already held a foreign chain (e.g. a mainnet chain synced into a
@@ -698,7 +905,10 @@ pub async fn start_hsd(state: State<'_, AppState>) -> Result<serde_json::Value, 
         "process_alive": true,
         "data_dir": data_dir,
         "network": network.as_str(),
-        "message": "hsd is still starting; status will update when its RPC responds.",
+        "message": format!(
+            "{} is still starting; status will update when its RPC responds.",
+            engine.as_str()
+        ),
     }))
 }
 
@@ -1156,6 +1366,54 @@ pub async fn check_node_connection(
         return Err(AppError::InvalidInput(
             "node RPC URL is required".to_string(),
         ));
+    }
+    let engine = configured_node_engine(&state)?;
+    if engine == NodeEngine::Hsrd {
+        let authorization = {
+            let conn = state.db.lock().map_err(|e| AppError::Lock(e.to_string()))?;
+            let settings = db::queries::get_settings(&conn)?;
+            api_key
+                .as_deref()
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .map(str::to_string)
+                .or_else(|| settings.get("hsrd_authorization_header").cloned())
+                .unwrap_or_default()
+        };
+        let expected_network = {
+            let conn = state.db.lock().map_err(|e| AppError::Lock(e.to_string()))?;
+            match expected_network
+                .as_ref()
+                .map(|value| value.trim())
+                .filter(|value| !value.is_empty())
+            {
+                Some(value) => Some(value.to_string()),
+                None => db::queries::get_active_profile_network(&conn)?,
+            }
+        };
+        return Ok(match probe_hsrd(url, &authorization).await {
+            Some(probe) => NodeConnectionCheck {
+                reachable: true,
+                height: Some(probe.height),
+                headers: probe.headers,
+                synced: probe.verification_progress == Some(1.0),
+                network: probe.chain.clone(),
+                network_matches: crate::noncustodial::network::network_check(
+                    expected_network.as_deref(),
+                    probe.chain.as_deref(),
+                ),
+                error: None,
+            },
+            None => NodeConnectionCheck {
+                reachable: false,
+                height: None,
+                headers: None,
+                synced: false,
+                network: None,
+                network_matches: None,
+                error: Some("hsrd status/sync endpoint is unreachable".to_string()),
+            },
+        });
     }
     // Resolve the key AND the expected network inside a block so the DB lock
     // is released before the network round-trip below.

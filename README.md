@@ -127,6 +127,9 @@ Built with Tauri v2, React + TypeScript, Rust, and SQLite.
   and are cached locally per wallet; other networks need an explorer URL of yours. Links to transactions, names, and addresses open on Shakeshift.
 - **Sending needs a node.** Broadcasting and coin/owner discovery use a local
   **hsd** node over RPC. The app can start/stop hsd for you (Settings → Connections).
+  An experimental **hsrd** engine can also be selected there; its local lifecycle
+  and diagnostics are available, but wallet reads and broadcasts remain disabled
+  until the hsrd wallet API adapter is complete.
 - **Secrets stay in a secure window.** Your mnemonic/passphrase is only ever typed
   into — and your backup phrase only ever shown in — a small **Rust-owned window**;
   it never passes through the web UI. At rest it's an **encrypted vault**
@@ -163,6 +166,9 @@ For a detailed threat model, attack surfaces, and mitigations, see [SECURITY.md]
 - [Rust](https://www.rust-lang.org/tools/install) (stable, edition 2021)
 - [hsd](https://github.com/handshake-org/hsd) — **only needed for sending / name
   actions** (reads work without it). Run it with `--index-address`.
+- [hsrd](https://github.com/handshake-org/hsrd) — experimental alternative node
+  engine. It must be installed locally and run with `--wallet-index`; Namehold
+  currently uses it only for lifecycle and diagnostic checks.
 
 ## Quick start
 
@@ -187,6 +193,9 @@ hsd --index-address --index-tx --api-key=<your-key>
   `--index-tx` backs transaction history + confirmation tracking.
 - The app can manage hsd for you — set the **data directory** and (if needed) the
   **hsd binary path** in **Settings → Connections**, then click **Start hsd**.
+- Settings → Connections also offers **hsrd (Rust, experimental)**. Set its
+  installed binary path and authorization header when required. Namehold starts
+  it with `--wallet-index`, but does not yet enable wallet operations through it.
 - **hsd can't add an index to an already-synced chain.** If your existing chain
   was synced without these indexes, the app detects it and offers a **one-click
   re-sync** (it moves the old chain to a backup and re-syncs with the right indexes).

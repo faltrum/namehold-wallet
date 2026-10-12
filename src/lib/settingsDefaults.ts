@@ -14,11 +14,14 @@
 import type { Settings } from "../types";
 
 export const DEFAULT_SETTINGS: Settings = {
+  node_engine: "hsd",
   // Sending node (hsd RPC); reads come from the explorer below.
   node_rpc_url: "http://127.0.0.1:12037",
   node_rpc_api_key: "",
   hsd_prefix: "",
   hsd_path: "",
+  hsrd_path: "",
+  hsrd_authorization_header: "",
   autostart_hsd: "true",
   explorer_api_url: "https://e.hnsfans.com",
   address_gap_limit: "20",

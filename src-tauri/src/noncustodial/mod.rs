@@ -12,6 +12,7 @@ pub mod cookie_vault;
 pub mod covenants;
 pub mod derivation;
 pub mod hd;
+pub mod hsrd_rpc;
 pub mod message;
 pub mod names;
 pub mod network;

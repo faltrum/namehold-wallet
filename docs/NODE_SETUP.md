@@ -15,6 +15,15 @@ device. It splits how it talks to the Handshake network:
 
   So to send, run hsd yourself (locally, or on a small VPS — the chain is light).
 
+> **Experimental hsrd support:** Settings → Connections can select the native Rust
+> `hsrd` engine and manage its local process. Configure the installed binary and
+> the exact `Authorization` header required by its RPC server. Namehold starts
+> `hsrd` with `--wallet-index`, queries its v1 wallet API, and can reconcile
+> indexed UTXOs into the local wallet cache. Name evidence, name actions, and
+> transaction broadcast are not enabled for `hsrd` yet. See
+> [`HSRD_INTEGRATION.md`](HSRD_INTEGRATION.md) for the complete setup and
+> troubleshooting guide. `hsd` remains the default engine.
+
 ## Run a node for sending
 
 ```sh

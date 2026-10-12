@@ -34,6 +34,7 @@ export interface NodeStatus {
   read_source: "local" | "explorer";
   /** Node operating mode: "full" or "spv". */
   node_mode: NodeMode;
+  node_engine: "hsd" | "hsrd";
 }
 
 /** Poll the hsd node status (binary, data dir, connected, height). */

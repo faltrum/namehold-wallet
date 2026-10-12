@@ -77,10 +77,13 @@ export function Settings() {
   useEffect(() => {
     if (settings) {
       setForm({
+        node_engine: settings.node_engine,
         node_rpc_url: settings.node_rpc_url,
         node_rpc_api_key: settings.node_rpc_api_key,
         hsd_prefix: settings.hsd_prefix,
         hsd_path: settings.hsd_path,
+        hsrd_path: settings.hsrd_path,
+        hsrd_authorization_header: settings.hsrd_authorization_header,
         autostart_hsd: settings.autostart_hsd,
         background_sync_enabled: settings.background_sync_enabled,
         node_mode: settings.node_mode,
@@ -205,6 +208,13 @@ export function Settings() {
     if (hasStoredApiKey && (normalized.node_rpc_api_key ?? "") === "") {
       delete normalized.node_rpc_api_key;
     }
+    const hasStoredHsrdAuth = hasStoredSecret(settings, "hsrd_authorization_header");
+    if (
+      hasStoredHsrdAuth &&
+      (normalized.hsrd_authorization_header ?? "") === ""
+    ) {
+      delete normalized.hsrd_authorization_header;
+    }
     setSaving(true);
     try {
       await saveAll(normalized);
@@ -284,6 +294,21 @@ export function Settings() {
         </div>
 
         <div className="space-y-2 pt-2 border-t border-gray-100">
+          <label className="text-sm font-medium">Local node engine</label>
+          <select
+            value={form.node_engine ?? "hsd"}
+            onChange={(e) => updateField("node_engine", e.target.value)}
+            className="w-full border border-gray-300 rounded px-2 py-1.5 text-sm"
+            data-testid="node-engine-select"
+          >
+            <option value="hsd">hsd (JavaScript)</option>
+            <option value="hsrd">hsrd (Rust, experimental)</option>
+          </select>
+          <div className="text-xs text-gray-500">
+            hsd remains the default. hsrd uses its separate wallet API adapter;
+            wallet reads and broadcasts stay disabled for hsrd until that adapter
+            is enabled in a later migration phase.
+          </div>
           <label className="text-sm font-medium">Chain source</label>
           <select
             value={toConnectionMode(chainSource, nodeMode)}
@@ -324,7 +349,8 @@ export function Settings() {
             }
           />
           <div className="text-xs text-gray-500">
-            Needed only to send or do name actions. Run hsd with <code>--index-address</code>. See
+            Needed only to send or do name actions. Run the selected node with its required wallet
+            index. See
             NODE_SETUP.md. "Test connection" reuses your stored API key when the URL matches the
             saved node.
           </div>
@@ -341,7 +367,7 @@ export function Settings() {
           <div className="flex items-end gap-2">
             <div className="flex-1">
               <Input
-                label="Node data directory (hsd --prefix)"
+                label={`Node data directory (${form.node_engine === "hsrd" ? "hsrd --data-dir" : "hsd --prefix"})`}
                 value={form.hsd_prefix ?? ""}
                 onChange={(e) => updateField("hsd_prefix", e.target.value)}
                 placeholder="(default: ~/.hsd)"
@@ -352,20 +378,48 @@ export function Settings() {
             </Button>
           </div>
           <div className="text-xs text-gray-500">
-            Where hsd stores the chain. Point this at e.g. <code>/Volumes/WD/hsd-data</code> to keep
-            the large chain off your home disk. Empty uses hsd's default (<code>~/.hsd</code>).
+            Where the selected node stores the chain. Empty uses its default data directory.
           </div>
 
           <Input
-            label="hsd binary path (optional)"
-            value={form.hsd_path ?? ""}
-            onChange={(e) => updateField("hsd_path", e.target.value)}
-            placeholder="(auto-detect: Homebrew / npm / nvm / PATH)"
+            label={`${form.node_engine === "hsrd" ? "hsrd" : "hsd"} binary path (optional)`}
+            value={
+              form.node_engine === "hsrd"
+                ? (form.hsrd_path ?? "")
+                : (form.hsd_path ?? "")
+            }
+            onChange={(e) =>
+              updateField(form.node_engine === "hsrd" ? "hsrd_path" : "hsd_path", e.target.value)
+            }
+            placeholder={
+              form.node_engine === "hsrd"
+                ? "(auto-detect: ~/.cargo/bin / PATH)"
+                : "(auto-detect: Homebrew / npm / nvm / PATH)"
+            }
           />
           <div className="text-xs text-gray-500">
-            Leave empty to auto-detect. Set this if the app can't find your hsd install (e.g.{" "}
-            <code>$(which hsd)</code>). Save settings to apply.
+            Leave empty to auto-detect. Set this if the app can't find the selected node
+            executable. Save settings to apply.
           </div>
+          {form.node_engine === "hsrd" && (
+            <>
+              <Input
+                label="hsrd Authorization header (required)"
+                type="password"
+                value={form.hsrd_authorization_header ?? ""}
+                onChange={(e) => updateField("hsrd_authorization_header", e.target.value)}
+                placeholder={
+                  hasStoredSecret(settings, "hsrd_authorization_header")
+                    ? "•••••• (stored — leave blank to keep)"
+                    : "Exact value from hsrd authorization file"
+                }
+              />
+              <div className="text-xs text-gray-500">
+                The backend writes this value to a protected authorization file before starting
+                hsrd. It is never displayed or logged.
+              </div>
+            </>
+          )}
 
           <label className="flex items-center gap-2 text-sm pt-2">
             <input
@@ -374,10 +428,10 @@ export function Settings() {
               onChange={(e) => updateField("autostart_hsd", boolToSetting(e.target.checked))}
               data-testid="autostart-hsd-checkbox"
             />
-            Autostart HSD when the app launches
+            Autostart {form.node_engine === "hsrd" ? "hsrd" : "HSD"} when the app launches
           </label>
           <div className="text-xs text-gray-500">
-            Starts hsd against your data dir on launch. If a node is already running, Namehold
+            Starts the selected node against your data dir on launch. If a node is already running, Namehold
             adopts it instead of starting a duplicate. Change takes effect on the next launch.
           </div>
 
@@ -416,7 +470,15 @@ export function Settings() {
             the running node — no duplicate is spawned.
           </div>
 
-          <NodeControl dirty={dirty} hsdPathConfigured={!!settings.hsd_path?.trim()} />
+          <NodeControl
+            dirty={dirty}
+            hsdPathConfigured={
+              form.node_engine === "hsrd"
+                ? !!settings.hsrd_path?.trim()
+                : !!settings.hsd_path?.trim()
+            }
+            engine={form.node_engine === "hsrd" ? "hsrd" : "hsd"}
+          />
         </div>
       </div>
 
@@ -869,7 +931,15 @@ function SimulateUpdatePanel() {
  * with the configured data directory; `dirty` warns that an unsaved directory
  * change won't apply until settings are saved.
  */
-function NodeControl({ dirty, hsdPathConfigured }: { dirty: boolean; hsdPathConfigured: boolean }) {
+function NodeControl({
+  dirty,
+  hsdPathConfigured,
+  engine,
+}: {
+  dirty: boolean;
+  hsdPathConfigured: boolean;
+  engine: "hsd" | "hsrd";
+}) {
   const { data: status } = useNodeStatus();
   const start = useStartHsd();
   const stop = useStopHsd();
@@ -905,20 +975,20 @@ function NodeControl({ dirty, hsdPathConfigured }: { dirty: boolean; hsdPathConf
     try {
       const res = await start.mutateAsync();
       if (res?.connected) {
-        showToast("hsd connected", "success");
+        showToast(`${engine} connected`, "success");
       } else {
-        showToast("hsd is starting… status will update when its RPC responds.", "info");
+        showToast(`${engine} is starting… status will update when its RPC responds.`, "info");
       }
     } catch (e) {
-      showToast(`Failed to start hsd: ${e}`, "error");
+      showToast(`Failed to start ${engine}: ${e}`, "error");
     }
   };
   const onStop = async () => {
     try {
       await stop.mutateAsync();
-      showToast("hsd stopped", "success");
+      showToast(`${engine} stopped`, "success");
     } catch (e) {
-      showToast(`Failed to stop hsd: ${e}`, "error");
+      showToast(`Failed to stop ${engine}: ${e}`, "error");
     }
   };
   const onResync = async () => {
@@ -933,7 +1003,7 @@ function NodeControl({ dirty, hsdPathConfigured }: { dirty: boolean; hsdPathConf
       return;
     try {
       await resync.mutateAsync();
-      showToast("Re-syncing: old chain backed up; hsd is downloading again.", "info");
+      showToast(`Re-syncing: old chain backed up; ${engine} is downloading again.`, "info");
     } catch (e) {
       showToast(`Failed to re-sync: ${e}`, "error");
     }
@@ -948,7 +1018,7 @@ function NodeControl({ dirty, hsdPathConfigured }: { dirty: boolean; hsdPathConf
         </div>
         {processAlive || connected ? (
           <Button size="sm" variant="secondary" onClick={onStop} disabled={stop.isPending}>
-            {stop.isPending ? "Stopping…" : "Stop hsd"}
+            {stop.isPending ? "Stopping…" : `Stop ${engine}`}
           </Button>
         ) : (
           <Button
@@ -956,7 +1026,7 @@ function NodeControl({ dirty, hsdPathConfigured }: { dirty: boolean; hsdPathConf
             onClick={onStart}
             disabled={start.isPending || connected || (!status?.binary_found && !hsdPathConfigured)}
           >
-            {start.isPending ? "Starting…" : "Start hsd"}
+            {start.isPending ? "Starting…" : `Start ${engine}`}
           </Button>
         )}
       </div>
@@ -997,11 +1067,11 @@ function NodeControl({ dirty, hsdPathConfigured }: { dirty: boolean; hsdPathConf
         <div>
           {status?.binary_found ? (
             <>
-              hsd {status.version} · {status.network}
+              {engine} {status.version} · {status.network}
             </>
           ) : (
             <span className="text-red-600">
-              hsd binary not found — install it (<code>npm i -g hsd</code>).
+              {engine} binary not found — configure its path before starting it.
             </span>
           )}
         </div>

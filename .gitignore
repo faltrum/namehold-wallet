@@ -81,3 +81,6 @@ CLAUDE.md
 # Namebase account-history exports (sensitive, user data)
 namebase-history-*.csv
 account_history*.csv
+
+# Virtualenv
+.venv/

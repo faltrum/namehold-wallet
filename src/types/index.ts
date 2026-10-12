@@ -298,6 +298,8 @@ export interface WalletSnapshot {
  * local; there is no legacy hsd-wallet / connection-mode config.
  */
 export interface Settings {
+  /** Local node implementation. hsd remains the default during migration. */
+  node_engine: "hsd" | "hsrd";
   /** hsd node RPC used for sync + broadcast (sending). */
   node_rpc_url: string;
   node_rpc_api_key: string;
@@ -305,6 +307,10 @@ export interface Settings {
   hsd_prefix: string;
   /** Explicit path to the hsd binary. Empty = auto-discover (common dirs + PATH). */
   hsd_path: string;
+  /** Explicit path to the optional hsrd binary. */
+  hsrd_path: string;
+  /** Exact Authorization header value used by hsrd's wallet API. */
+  hsrd_authorization_header: string;
   /**
    * "true" | "false" — start hsd automatically when the app launches. Default
    * "true". Honored only at app-launch time (a runtime toggle affects the next

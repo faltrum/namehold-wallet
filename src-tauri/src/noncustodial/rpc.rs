@@ -27,6 +27,39 @@ use std::time::Duration;
 use crate::error::AppError;
 use crate::noncustodial::network::Network;
 
+/// Local node implementation selected for the managed node lifecycle.
+///
+/// The wire clients remain separate: `NodeRpcClient` speaks hsd's JSON-RPC
+/// and REST APIs, while the hsrd adapter is added in a later migration phase.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum NodeEngine {
+    Hsd,
+    Hsrd,
+}
+
+impl NodeEngine {
+    pub fn from_setting(value: &str) -> Self {
+        match value.trim().to_ascii_lowercase().as_str() {
+            "hsrd" => Self::Hsrd,
+            _ => Self::Hsd,
+        }
+    }
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Hsd => "hsd",
+            Self::Hsrd => "hsrd",
+        }
+    }
+}
+
+pub fn resolve_node_engine(settings: &HashMap<String, String>) -> NodeEngine {
+    settings
+        .get("node_engine")
+        .map(|value| NodeEngine::from_setting(value))
+        .unwrap_or(NodeEngine::Hsd)
+}
+
 /// Where the engine reads chain state and broadcasts transactions.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ChainSource {
@@ -189,6 +222,7 @@ pub struct NodeRpcClient {
     node_url: String,
     api_key: String,
     source: ChainSource,
+    engine: NodeEngine,
 }
 
 // Manual `Debug` that redacts `api_key` — the key is a bearer credential for
@@ -200,6 +234,7 @@ impl std::fmt::Debug for NodeRpcClient {
             .field("node_url", &self.node_url)
             .field("api_key", &"<redacted>")
             .field("source", &self.source)
+            .field("engine", &self.engine)
             .finish()
     }
 }
@@ -362,6 +397,7 @@ impl NodeRpcClient {
             node_url: node_url.trim_end_matches('/').to_string(),
             api_key: String::new(),
             source,
+            engine: NodeEngine::Hsd,
         })
     }
 
@@ -378,6 +414,7 @@ impl NodeRpcClient {
             node_url: node_url.trim_end_matches('/').to_string(),
             api_key: api_key.to_string(),
             source,
+            engine: NodeEngine::Hsd,
         })
     }
 
@@ -391,7 +428,9 @@ impl NodeRpcClient {
             .unwrap_or("http://127.0.0.1:12037");
         let key = resolve_node_api_key(settings);
         let source = ChainSource::from_settings(settings);
-        Self::new(url, &key, source)
+        let mut client = Self::new(url, &key, source);
+        client.engine = resolve_node_engine(settings);
+        client
     }
 
     /// Construct from a resolved [`EffectiveNodeConfig`] (ADR-001).
@@ -403,7 +442,9 @@ impl NodeRpcClient {
     pub fn from_effective_config(
         cfg: &crate::noncustodial::node_config::EffectiveNodeConfig,
     ) -> Self {
-        Self::new(&cfg.node_rpc_url, &cfg.node_rpc_api_key, cfg.chain_source)
+        let mut client = Self::new(&cfg.node_rpc_url, &cfg.node_rpc_api_key, cfg.chain_source);
+        client.engine = cfg.node_engine;
+        client
     }
 
     /// Resolve the effective node config for `profile_id` and build a client.
@@ -448,6 +489,9 @@ impl NodeRpcClient {
         method: &str,
         params: serde_json::Value,
     ) -> Result<T, AppError> {
+        if self.engine == NodeEngine::Hsrd {
+            return Err(AppError::UnsupportedNodeEngine);
+        }
         let req = RpcRequest { method, params };
         let resp = self
             .http
@@ -1216,6 +1260,24 @@ mod tests {
     use super::*;
 
     #[test]
+    fn node_engine_parses_known_and_unknown_values() {
+        assert_eq!(NodeEngine::from_setting("hsd"), NodeEngine::Hsd);
+        assert_eq!(NodeEngine::from_setting(" HSRD "), NodeEngine::Hsrd);
+        assert_eq!(NodeEngine::from_setting("unsupported"), NodeEngine::Hsd);
+        assert_eq!(NodeEngine::Hsd.as_str(), "hsd");
+        assert_eq!(NodeEngine::Hsrd.as_str(), "hsrd");
+    }
+
+    #[test]
+    fn node_engine_resolution_defaults_to_hsd() {
+        let mut settings = HashMap::new();
+        assert_eq!(resolve_node_engine(&settings), NodeEngine::Hsd);
+
+        settings.insert("node_engine".to_owned(), "hsrd".to_owned());
+        assert_eq!(resolve_node_engine(&settings), NodeEngine::Hsrd);
+    }
+
+    #[test]
     fn chain_source_parses_and_gates_broadcast() {
         assert_eq!(
             ChainSource::from_setting("local_node"),
@@ -1350,6 +1412,7 @@ mod tests {
         assert_eq!(client.node_url, "http://127.0.0.1:12037");
         assert_eq!(client.api_key, "");
         assert_eq!(client.source, ChainSource::LocalNode);
+        assert_eq!(client.engine, NodeEngine::Hsd);
     }
 
     #[test]
@@ -1365,6 +1428,24 @@ mod tests {
         assert_eq!(client.node_url, "https://10.0.0.5:13037");
         assert_eq!(client.api_key, "secret");
         assert_eq!(client.source, ChainSource::RemoteNode);
+    }
+
+    #[test]
+    fn from_settings_marks_hsrd_without_using_hsd_wire_protocol() {
+        let mut settings = HashMap::new();
+        settings.insert("node_engine".to_string(), "hsrd".to_string());
+        let client = NodeRpcClient::from_settings(&settings);
+        assert_eq!(client.engine, NodeEngine::Hsrd);
+    }
+
+    #[tokio::test]
+    async fn hsrd_client_rejects_legacy_calls_before_network_access() {
+        let mut settings = HashMap::new();
+        settings.insert("node_engine".to_string(), "hsrd".to_string());
+        let client = NodeRpcClient::from_settings(&settings);
+
+        let error = client.get_blockchain_info().await.unwrap_err();
+        assert!(matches!(error, AppError::UnsupportedNodeEngine));
     }
 
     #[test]

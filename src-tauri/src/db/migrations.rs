@@ -55,6 +55,7 @@ const MIGRATIONS: &[(&str, &str)] = &[
         include_str!("../sql/032_clear_seeded_mainnet_explorer.sql"),
     ),
     ("033", include_str!("../sql/033_shakedex.sql")),
+    ("034", include_str!("../sql/034_node_engine.sql")),
 ];
 
 pub fn run(conn: &Connection) -> Result<(), rusqlite::Error> {
@@ -96,7 +97,7 @@ mod tests {
         let count: i64 = conn
             .query_row("SELECT COUNT(*) FROM schema_version", [], |row| row.get(0))
             .unwrap();
-        assert_eq!(count, 33, "expected 33 migrations, got {count}");
+        assert_eq!(count, 34, "expected 34 migrations, got {count}");
     }
 
     #[test]
@@ -107,7 +108,7 @@ mod tests {
         let count: i64 = conn
             .query_row("SELECT COUNT(*) FROM schema_version", [], |row| row.get(0))
             .unwrap();
-        assert_eq!(count, 33);
+        assert_eq!(count, 34);
     }
 
     #[test]

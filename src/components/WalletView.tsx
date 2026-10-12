@@ -699,7 +699,8 @@ export function WalletView() {
         }
       />
 
-      {syncStatus.data?.running && manualSync && (
+      {manualSync &&
+        (syncStatus.data?.running || syncStatus.data?.step === "error") && (
         <div
           className="bg-blue-50 border border-blue-200 rounded p-3 text-sm text-blue-800"
           data-testid="sync-status"

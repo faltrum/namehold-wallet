@@ -13,7 +13,7 @@
 //! [`EffectiveNodeConfig::url_from_override`]).
 
 use crate::error::AppError;
-use crate::noncustodial::rpc::{resolve_node_api_key, ChainSource};
+use crate::noncustodial::rpc::{resolve_node_api_key, ChainSource, NodeEngine};
 
 /// The built-in default node RPC URL when neither an override nor a global
 /// setting supplies one: mainnet's default hsd port, from
@@ -31,7 +31,12 @@ pub fn default_node_rpc_url() -> String {
 /// A profile may hold other per-profile settings; those say nothing about
 /// which node this profile talks to, so they must not make the config read as
 /// overridden.
-const NODE_CONFIG_KEYS: [&str; 3] = ["node_rpc_url", "node_rpc_api_key", "chain_source"];
+const NODE_CONFIG_KEYS: [&str; 4] = [
+    "node_rpc_url",
+    "node_rpc_api_key",
+    "chain_source",
+    "node_engine",
+];
 
 /// The resolved node configuration for one profile.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -42,6 +47,8 @@ pub struct EffectiveNodeConfig {
     pub node_rpc_api_key: String,
     /// Resolved chain source.
     pub chain_source: ChainSource,
+    /// The local node implementation selected for wallet operations.
+    pub node_engine: NodeEngine,
     /// True when the profile's own `profile_settings` supplied any key of the
     /// node-config tuple — whatever value it holds. "The user chose this here",
     /// not "this differs from global": a user who deliberately pins a profile
@@ -61,7 +68,8 @@ pub struct EffectiveNodeConfig {
 /// Resolution order per key: per-profile override -> global `settings` ->
 /// built-in default. Returns [`AppError::NotFound`] when the profile does not
 /// exist. Does not mutate or normalize the profile's network; it only resolves
-/// the node endpoint tuple `(node_rpc_url, node_rpc_api_key, chain_source)`.
+/// the node endpoint and engine tuple `(node_rpc_url, node_rpc_api_key,
+/// chain_source, node_engine)`.
 pub fn effective_node_config_for_profile(
     conn: &rusqlite::Connection,
     profile_id: &str,
@@ -99,11 +107,13 @@ pub fn effective_node_config_for_profile(
         .unwrap_or_else(default_node_rpc_url);
     let node_rpc_api_key = resolve_node_api_key(&merged);
     let chain_source = ChainSource::from_settings(&merged);
+    let node_engine = crate::noncustodial::rpc::resolve_node_engine(&merged);
 
     Ok(EffectiveNodeConfig {
         node_rpc_url,
         node_rpc_api_key,
         chain_source,
+        node_engine,
         from_override: NODE_CONFIG_KEYS.iter().any(|k| chosen_here(k)),
         url_from_override: chosen_here("node_rpc_url"),
     })

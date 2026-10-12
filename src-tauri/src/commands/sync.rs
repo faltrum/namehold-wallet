@@ -21,7 +21,9 @@
 
 use crate::db::queries;
 use crate::error::AppError;
-use crate::noncustodial::rpc::NodeRpcClient;
+use crate::noncustodial::hsrd_rpc::HsrdRpcClient;
+use crate::noncustodial::network::Network;
+use crate::noncustodial::rpc::{resolve_node_engine, NodeEngine, NodeRpcClient};
 use crate::AppState;
 use serde::Serialize;
 use std::collections::HashSet;
@@ -373,6 +375,9 @@ pub async fn start_full_sync(state: State<'_, AppState>) -> Result<serde_json::V
                 if s.cancel_requested {
                     s.step = "cancelled".into();
                     s.progress_label = "Sync stopped".into();
+                } else if s.step == "error" {
+                    // Preserve a deliberate backend refusal, such as selecting
+                    // hsrd before its wallet adapter is wired into sync.
                 } else {
                     s.step = "done".into();
                     s.progress_label = "Sync complete".into();
@@ -449,6 +454,34 @@ pub async fn run_sync_steps(
         .and_then(|c| queries::get_settings(&c).ok())
         .map(|s| crate::noncustodial::rpc::resolve_node_mode(&s))
         .unwrap_or(crate::noncustodial::rpc::NodeMode::Full);
+    let node_engine = open_conn(db_path)
+        .ok()
+        .and_then(|c| queries::get_settings(&c).ok())
+        .map(|s| crate::noncustodial::rpc::resolve_node_engine(&s))
+        .unwrap_or(crate::noncustodial::rpc::NodeEngine::Hsd);
+
+    if node_engine == crate::noncustodial::rpc::NodeEngine::Hsrd {
+        if report_progress {
+            let mut s = status.lock().await;
+            s.step = "node".into();
+            s.progress_label = "Syncing with hsrd wallet API...".into();
+        }
+        let synced = sync_node_step(db_path, profile_id).await;
+        if report_progress && !synced {
+            let mut s = status.lock().await;
+            s.step = "error".into();
+            s.progress_label = "hsrd wallet sync failed".into();
+            s.errors.push(
+                "Check the hsrd wallet API log and verify synchronization, wallet-index, and authorization."
+                    .into(),
+            );
+        } else if report_progress {
+            let mut s = status.lock().await;
+            s.step = "done".into();
+            s.progress_label = "hsrd wallet sync complete".into();
+        }
+        return;
+    }
 
     // Step 1: Node sync (best-effort).
     // In SPV mode, use the SPV-specific step (explorer-based, no --index-address).
@@ -658,6 +691,35 @@ pub async fn sync_node_step(db_path: &str, profile_id: &str) -> bool {
         Ok(c) => c,
         Err(_) => return false,
     };
+    let settings = match queries::get_settings(&conn) {
+        Ok(settings) => settings,
+        Err(_) => return false,
+    };
+    if resolve_node_engine(&settings) == NodeEngine::Hsrd {
+        let profile = match queries::get_wallet_profile(&conn, profile_id) {
+            Ok(Some(profile)) => profile,
+            _ => return false,
+        };
+        let network = match Network::from_str_opt(&profile.network) {
+            Some(network) => network,
+            None => return false,
+        };
+        let scripts = match conn
+            .prepare(
+                "SELECT script_pubkey_hex FROM derived_addresses
+                 WHERE wallet_profile_id = ?1 ORDER BY branch, child_index",
+            )
+            .and_then(|mut statement| {
+                statement
+                    .query_map(rusqlite::params![profile_id], |row| row.get::<_, String>(0))
+                    .and_then(|rows| rows.collect::<Result<Vec<_>, _>>())
+            }) {
+            Ok(scripts) => scripts,
+            Err(_) => return false,
+        };
+        drop(conn);
+        return sync_hsrd_node_step(db_path, profile_id, &settings, network, &scripts).await;
+    }
     drop(conn);
 
     let height = match client.get_blockchain_info().await {
@@ -677,6 +739,121 @@ pub async fn sync_node_step(db_path: &str, profile_id: &str) -> bool {
         Err(_) => return false,
     };
     apply_node_sync_batch(&mut conn, profile_id, &all_coins, height).is_ok()
+}
+
+async fn sync_hsrd_node_step(
+    db_path: &str,
+    profile_id: &str,
+    settings: &std::collections::HashMap<String, String>,
+    network: Network,
+    scripts: &[String],
+) -> bool {
+    let client = match HsrdRpcClient::from_settings(settings) {
+        Ok(client) => client,
+        Err(error) => {
+            eprintln!("hsrd wallet sync: cannot create client: {error}");
+            return false;
+        }
+    };
+    let mut script_ids = Vec::with_capacity(scripts.len());
+    eprintln!(
+        "hsrd wallet sync: scanning {} derived output scripts",
+        scripts.len()
+    );
+    if scripts.is_empty() {
+        eprintln!("hsrd wallet sync: no derived scripts are available for this profile");
+        return false;
+    }
+    for script in scripts {
+        match crate::noncustodial::hsrd_rpc::script_id_from_p2wpkh_script(script) {
+            Ok(script_id) => script_ids.push(script_id),
+            Err(error) => {
+                eprintln!("hsrd wallet sync: cannot derive script id: {error}");
+                return false;
+            }
+        }
+    }
+    script_ids.sort();
+    script_ids.dedup();
+
+    let (snapshot, confirmed) = {
+        let mut last_error = None;
+        let mut result = None;
+        for attempt in 0..3 {
+            let snapshot = match client.chain_snapshot().await {
+                Ok(snapshot) => snapshot,
+                Err(error) => {
+                    let retryable = error.to_string().contains("stale_snapshot");
+                    last_error = Some(error);
+                    if retryable && attempt < 2 {
+                        sleep(Duration::from_millis(250)).await;
+                        continue;
+                    }
+                    break;
+                }
+            };
+            match client.confirmed_scripts_all(&script_ids, &snapshot).await {
+                Ok(coins) => {
+                    result = Some((snapshot, coins));
+                    break;
+                }
+                Err(error) if error.to_string().contains("chain changed during") && attempt < 2 => {
+                    last_error = Some(error);
+                    sleep(Duration::from_millis(250)).await;
+                }
+                Err(error) => {
+                    last_error = Some(error);
+                    break;
+                }
+            }
+        }
+        match result {
+            Some(result) => result,
+            None => {
+                eprintln!(
+                    "hsrd wallet sync: chain snapshot/scan failed after retries: {}",
+                    last_error
+                        .map(|error| error.to_string())
+                        .unwrap_or_else(|| "unknown error".to_string())
+                );
+                return false;
+            }
+        }
+    };
+    let height = match snapshot
+        .tip
+        .as_ref()
+        .and_then(|tip| i64::try_from(tip.height).ok())
+    {
+        Some(height) => height,
+        None => return false,
+    };
+    let coins = confirmed
+        .iter()
+        .map(|coin| coin.coin.to_node_coin(network))
+        .collect::<Result<Vec<_>, _>>();
+    let coins = match coins {
+        Ok(coins) => coins,
+        Err(error) => {
+            eprintln!("hsrd wallet sync: coin conversion failed: {error}");
+            return false;
+        }
+    };
+    eprintln!("hsrd wallet sync: received {} UTXOs", coins.len());
+    let mut conn = match open_conn(db_path) {
+        Ok(conn) => conn,
+        Err(error) => {
+            eprintln!("hsrd wallet sync: cannot open database: {error}");
+            return false;
+        }
+    };
+    match apply_node_sync_batch(&mut conn, profile_id, &coins, height) {
+        Ok(()) => true,
+        Err(error) => {
+            eprintln!("hsrd wallet sync: cannot apply UTXOs: {error}");
+            false
+        }
+    }
 }
 
 /// Client-injected coin-fetch phase for [`sync_node_step`], with the

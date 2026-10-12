@@ -22,6 +22,7 @@ export function makeNodeStatus(over: Partial<NodeStatus> = {}): NodeStatus {
     index_mismatch: false,
     read_source: "explorer",
     node_mode: "full",
+    node_engine: "hsd",
     ...over,
   };
 }
