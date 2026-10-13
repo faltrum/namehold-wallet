@@ -29,6 +29,9 @@ The current adapter supports the read-only wallet reconciliation path:
 11. Scan every confirmed script-history page, fetch retained transaction bodies
     with `raw_transaction`, decode Handshake covenants, and persist historical
     name events in `hsrd_name_history`.
+12. Store decoded hsrd transactions in the same normalized cache shape used by
+    the existing hsd Activity classifier, so the existing Activity UI can read
+    both engines without a second history implementation.
 
 The adapter retries a scan when `hsrd` reports `stale_snapshot` or when the
 chain epoch changes during pagination. A retry discards partial results rather
@@ -41,6 +44,9 @@ The following surfaces are intentionally not enabled for `hsrd` yet:
 - historical name events are persisted, but the existing Names view still
   presents the current owned-name projection rather than an historical event
   browser;
+- historical hsrd Activity attribution is conservative when raw transactions
+  do not include resolved input coins; the wallet's known tracked outpoints are
+  the authority for ownership;
 - name actions such as renew, reveal, redeem, register, update, and transfer;
 - transaction construction against `hsrd`-specific evidence;
 - transaction broadcast;

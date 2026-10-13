@@ -37,6 +37,7 @@ use tauri::State;
 
 use crate::commands::read::resolve_profile;
 use crate::error::AppError;
+use crate::noncustodial::rpc::{resolve_node_engine, NodeEngine};
 use crate::noncustodial::sync::{
     COV_BID, COV_CLAIM, COV_FINALIZE, COV_NONE, COV_OPEN, COV_REDEEM, COV_REGISTER, COV_RENEW,
     COV_REVEAL, COV_REVOKE, COV_TRANSFER, COV_UPDATE,
@@ -325,6 +326,16 @@ pub async fn read_action_history(
         None => return Ok(Vec::new()),
     };
 
+    {
+        let conn = state.db.lock().map_err(|e| AppError::Lock(e.to_string()))?;
+        let settings = crate::db::queries::get_settings(&conn)?;
+        if resolve_node_engine(&settings) == NodeEngine::Hsrd {
+            // hsrd history is populated during wallet sync; reading the cache
+            // keeps Activity independent from the node's REST history routes.
+            return read_hsrd_cached_action_history(&conn, &profile_id);
+        }
+    }
+
     // Snapshot addresses + build the node client under a short DB lock; drop before .await.
     // Per-profile node override routing (ADR-001): this profile's effective
     // node config, and an error when it will not resolve. Falling back to
@@ -337,6 +348,43 @@ pub async fn read_action_history(
     };
     if addresses.is_empty() {
         return Ok(Vec::new());
+    }
+
+    /// Classify transactions already fetched by the hsrd sync path. The hsrd
+    /// adapter stores the same normalized JSON shape used by the hsd classifier,
+    /// so Activity keeps one frontend contract and one covenant classification.
+    pub(crate) fn read_hsrd_cached_action_history(
+        conn: &rusqlite::Connection,
+        profile_id: &str,
+    ) -> Result<Vec<ActionRow>, AppError> {
+        let addresses = load_wallet_addresses(conn, profile_id)?;
+        let our: HashSet<String> = addresses.into_iter().collect();
+        let mut statement = conn.prepare(
+            "SELECT raw_json FROM wallet_transactions_cache
+             WHERE wallet_profile_id = ?1 AND raw_json IS NOT NULL",
+        )?;
+        let rows = statement.query_map([profile_id], |row| row.get::<_, String>(0))?;
+        let mut by_txid = BTreeMap::new();
+        for row in rows {
+            let raw = row?;
+            // A malformed cache row must not hide the rest of the wallet
+            // history. The sync path validates new rows before writing them.
+            let value: serde_json::Value = match serde_json::from_str(&raw) {
+                Ok(value) => value,
+                Err(_) => continue,
+            };
+            if let Some(txid) = value.get("hash").and_then(|hash| hash.as_str()) {
+                // A transaction can touch several derived scripts, so history
+                // is deduplicated by txid before covenant classification.
+                by_txid.entry(txid.to_string()).or_insert(value);
+            }
+        }
+        let mut result = by_txid
+            .values()
+            .filter_map(|tx| classify_tx(tx, &our))
+            .collect::<Vec<_>>();
+        result.sort_by(|a, b| compare_action_rows_by_recency(a.height, &a.txid, b.height, &b.txid));
+        Ok(result)
     }
 
     let our: HashSet<String> = addresses.iter().cloned().collect();

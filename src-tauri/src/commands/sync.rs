@@ -900,6 +900,7 @@ async fn sync_hsrd_node_step(
                 profile_id,
                 client.clone(),
                 snapshot.chain_epoch,
+                network,
                 confirmed.history,
             )
             .await;
@@ -1141,8 +1142,12 @@ async fn sync_hsrd_history(
     profile_id: &str,
     client: HsrdRpcClient,
     chain_epoch: u64,
+    network: Network,
     history: Vec<crate::noncustodial::hsrd_rpc::ConfirmedScriptHistory>,
 ) {
+    // The index may report the same transaction through multiple derived
+    // scripts. Keep one row per txid while retaining its first known direction
+    // and height for the historical projection.
     let mut directions = HashMap::new();
     for row in history {
         let direction = match (row.entry.direction.received, row.entry.direction.spent) {
@@ -1163,6 +1168,8 @@ async fn sync_hsrd_history(
     let mut transactions = Vec::new();
     let mut pruned_transactions = 0usize;
     for (txid, (direction, height)) in directions {
+        // Script history is only metadata; covenant classification requires
+        // the retained raw transaction body from the wallet API.
         let raw = match client.raw_transaction(&txid, chain_epoch).await {
             Ok(raw) => raw,
             Err(error) => {
@@ -1214,8 +1221,11 @@ async fn sync_hsrd_history(
     };
     let mut events = 0usize;
     for (txid, direction, height, raw_hex, transaction) in transactions {
-        let raw_json =
-            serde_json::json!({"hsrd": true, "txid": txid, "rawHex": raw_hex}).to_string();
+        let raw_json = transaction
+            .to_history_json(&txid, Some(i64::from(height)), None, network, &raw_hex)
+            .to_string();
+        // Store the normalized shape expected by the existing hsd Activity
+        // classifier so both node engines share one frontend contract.
         if let Err(error) = crate::noncustodial::sync::cache_transaction(
             &tx,
             profile_id,

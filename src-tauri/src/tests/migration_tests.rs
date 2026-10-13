@@ -71,8 +71,10 @@ fn test_schema_version_tracking() {
     // 032 (clear_seeded_mainnet_explorer: 009 seeded a mainnet URL that
     //      outranked the network default on every other network).
     // 033 (shakedex_purchases: buyer-side Shakedex purchase tracking).
-    // 035 (hsrd historical name covenant events).
-    assert_eq!(count, 35);
+    // 034 (node_engine: persist the selected hsd/hsrd backend).
+    // 035 (hsrd_name_history: retain historical hsrd covenant events).
+    // 036 (hsrd sync checkpoints).
+    assert_eq!(count, 36);
 }
 
 #[test]

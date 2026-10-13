@@ -576,6 +576,67 @@ impl Transaction {
             locktime,
         })
     }
+
+    /// Convert a decoded transaction into the JSON shape consumed by the
+    /// existing wallet-history classifier. Keeping this adapter here lets
+    /// hsd JSON and hsrd raw transactions share the same Activity pipeline.
+    pub fn to_history_json(
+        &self,
+        txid: &str,
+        height: Option<i64>,
+        time: Option<i64>,
+        network: Network,
+        raw_hex: &str,
+    ) -> serde_json::Value {
+        // hsd exposes address strings directly, while hsrd raw outputs carry
+        // only witness data. Re-encode supported P2WPKH outputs here so the
+        // existing wallet-address attribution remains unchanged.
+        let outputs = self
+            .outputs
+            .iter()
+            .map(|output| {
+                let address = if output.address.version == 0 && output.address.hash.len() == 20 {
+                    let mut hash = [0u8; 20];
+                    hash.copy_from_slice(&output.address.hash);
+                    address::encode_p2wpkh(network, &hash)
+                        .unwrap_or_else(|_| hex::encode(&output.address.hash))
+                } else {
+                    hex::encode(&output.address.hash)
+                };
+                serde_json::json!({
+                    "value": output.value,
+                    "address": address,
+                    "covenant": {
+                        "type": output.covenant.covenant_type,
+                        "items": output.covenant.items.iter().map(hex::encode).collect::<Vec<_>>(),
+                    }
+                })
+            })
+            .collect::<Vec<_>>();
+        let inputs = self
+            .inputs
+            .iter()
+            .map(|input| {
+                serde_json::json!({
+                    "prevout": {
+                        "hash": hex::encode(input.prevout.hash),
+                        "index": input.prevout.index,
+                    }
+                })
+            })
+            .collect::<Vec<_>>();
+        // Keep hsrd-specific raw bytes under a namespaced field; the common
+        // classifier only consumes the normalized transaction fields above.
+        serde_json::json!({
+            "hash": txid,
+            "height": height,
+            "time": time,
+            "inputs": inputs,
+            "outputs": outputs,
+            "locktime": self.locktime,
+            "hsrd": { "rawHex": raw_hex }
+        })
+    }
 }
 
 /// A bounds-checked little-endian reader, the inverse of [`Writer`], for
@@ -684,6 +745,32 @@ mod tests {
         let mut w = Writer::new();
         cov.write(&mut w);
         assert_eq!(w.into_bytes(), vec![0x00, 0x00]);
+    }
+
+    #[test]
+    fn history_json_preserves_covenant_items_and_address() {
+        let mut tx = Transaction::new();
+        tx.outputs.push(Output {
+            value: 123,
+            address: OutputAddress {
+                version: 0,
+                hash: vec![0x11; 20],
+            },
+            covenant: Covenant {
+                covenant_type: 3,
+                items: vec![vec![0xaa; 32], vec![1, 2]],
+            },
+        });
+        let json = tx.to_history_json("aa", Some(7), None, Network::Main, "beef");
+        assert_eq!(json["hash"], "aa");
+        assert_eq!(json["height"], 7);
+        assert_eq!(json["outputs"][0]["value"], 123);
+        assert_eq!(json["outputs"][0]["covenant"]["type"], 3);
+        assert_eq!(json["outputs"][0]["covenant"]["items"][0], "aa".repeat(32));
+        assert!(json["outputs"][0]["address"]
+            .as_str()
+            .unwrap()
+            .starts_with("hs1"));
     }
 
     #[test]
