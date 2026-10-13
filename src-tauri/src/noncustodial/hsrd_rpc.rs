@@ -5,7 +5,7 @@
 //! phase 3 starts with `chain_snapshot` before wallet data is enabled.
 
 use reqwest::Client;
-use serde::de::DeserializeOwned;
+use serde::de::{DeserializeOwned, Error as SerdeError};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -60,14 +60,167 @@ pub struct ChainSnapshot {
     pub tip: Option<ChainTip>,
 }
 
+#[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
+pub struct HsrdNameOwner {
+    pub txid: String,
+    pub index: u32,
+}
+
+#[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
+pub struct HsrdNameState {
+    pub name_hash: String,
+    pub name_hex: String,
+    pub height: u64,
+    pub renewal: u64,
+    pub owner: Option<HsrdNameOwner>,
+    pub value: u64,
+    pub highest: u64,
+    pub data_hex: String,
+    pub transfer: u64,
+    pub revoked: u64,
+    pub claimed: u64,
+    pub renewals: u64,
+    pub registered: bool,
+    pub expired: bool,
+    pub weak: bool,
+}
+
+#[derive(Debug, Clone, Deserialize, PartialEq)]
+pub struct NameEvidence {
+    pub projection_version: u32,
+    pub chain_epoch: u64,
+    pub tip: Option<ChainTip>,
+    pub current_state_hex: String,
+    pub current_state: Option<HsrdNameState>,
+    pub proof_state: Option<HsrdNameState>,
+    pub proof_hex: String,
+}
+
+#[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
+pub struct ActiveNameOwnerCoin {
+    pub projection_version: u32,
+    pub chain_epoch: u64,
+    pub tip: ChainTip,
+    pub current_state_hex: String,
+    pub current_state: HsrdNameState,
+    pub owner_coin: HsrdCoin,
+    pub inclusion: Value,
+    pub source_binding: String,
+}
+
 #[derive(Debug, Clone, Deserialize, PartialEq)]
 pub struct ConfirmedScriptsPage {
     pub chain_epoch: u64,
     pub tip: Option<ChainTip>,
-    pub history: Vec<Value>,
+    pub history: Vec<ConfirmedScriptHistory>,
     pub utxos: Vec<ConfirmedScriptUtxo>,
     pub script_examinations: usize,
-    pub continuation: Option<String>,
+    pub continuation: Option<Value>,
+}
+
+/// One wallet-index history row. The node deliberately keeps this row small;
+/// the transaction body is fetched separately with `raw_transaction`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ConfirmedScriptHistory {
+    pub script_index: usize,
+    pub entry: ConfirmedScriptHistoryEntry,
+    pub block_time: Option<u64>,
+}
+
+impl<'de> Deserialize<'de> for ConfirmedScriptHistory {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        #[derive(Deserialize)]
+        struct RawHistory {
+            script_index: Option<usize>,
+            entry: Option<ConfirmedScriptHistoryEntry>,
+            txid: Option<String>,
+            block_hash: Option<String>,
+            height: Option<u32>,
+            transaction_position: Option<u32>,
+            direction: Option<Value>,
+            block_time: Option<u64>,
+        }
+
+        let raw = RawHistory::deserialize(deserializer)?;
+        let script_index = raw.script_index.unwrap_or_default();
+        if let Some(entry) = raw.entry {
+            return Ok(Self {
+                script_index,
+                entry,
+                block_time: raw.block_time,
+            });
+        }
+
+        let direction = match raw.direction {
+            Some(Value::Object(object)) => ConfirmedScriptHistoryDirection {
+                received: object
+                    .get("received")
+                    .and_then(Value::as_bool)
+                    .unwrap_or(false),
+                spent: object
+                    .get("spent")
+                    .and_then(Value::as_bool)
+                    .unwrap_or(false),
+            },
+            Some(Value::String(value)) => ConfirmedScriptHistoryDirection {
+                received: value == "received" || value == "received+spent",
+                spent: value == "spent" || value == "received+spent",
+            },
+            _ => ConfirmedScriptHistoryDirection {
+                received: false,
+                spent: false,
+            },
+        };
+        Ok(Self {
+            script_index,
+            entry: ConfirmedScriptHistoryEntry {
+                txid: raw.txid.ok_or_else(|| D::Error::missing_field("txid"))?,
+                block_hash: raw
+                    .block_hash
+                    .ok_or_else(|| D::Error::missing_field("block_hash"))?,
+                height: raw
+                    .height
+                    .ok_or_else(|| D::Error::missing_field("height"))?,
+                transaction_position: raw
+                    .transaction_position
+                    .ok_or_else(|| D::Error::missing_field("transaction_position"))?,
+                direction,
+            },
+            block_time: raw.block_time,
+        })
+    }
+}
+
+#[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
+pub struct ConfirmedScriptHistoryEntry {
+    pub txid: String,
+    pub block_hash: String,
+    pub height: u32,
+    pub transaction_position: u32,
+    pub direction: ConfirmedScriptHistoryDirection,
+}
+
+#[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
+pub struct ConfirmedScriptHistoryDirection {
+    pub received: bool,
+    pub spent: bool,
+}
+
+#[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
+pub struct RawTransaction {
+    pub chain_epoch: u64,
+    pub tip: Option<ChainTip>,
+    pub txid: String,
+    pub raw_hex: Option<String>,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ConfirmedScriptsScan {
+    pub history: Vec<ConfirmedScriptHistory>,
+    pub utxos: Vec<ConfirmedScriptUtxo>,
 }
 
 #[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
@@ -221,6 +374,102 @@ impl HsrdRpcClient {
         self.call("chain_snapshot", None).await
     }
 
+    /// Read the canonical current NameState and active owner coin under one
+    /// immutable chain snapshot.
+    pub async fn active_name_owner_coin(
+        &self,
+        name_hash: &str,
+        expected_chain_epoch: u64,
+    ) -> Result<ActiveNameOwnerCoin, AppError> {
+        validate_hash_hex(name_hash, "hsrd name_hash")?;
+        let result: ActiveNameOwnerCoin = self
+            .call(
+                "active_name_owner_coin",
+                Some(json!({
+                    "name_hash": name_hash,
+                    "expected_chain_epoch": expected_chain_epoch,
+                })),
+            )
+            .await?;
+        if result.chain_epoch != expected_chain_epoch {
+            return Err(AppError::Rpc(
+                "hsrd active name owner response changed chain epoch".to_string(),
+            ));
+        }
+        if !result
+            .current_state
+            .name_hash
+            .eq_ignore_ascii_case(name_hash)
+        {
+            return Err(AppError::Rpc(
+                "hsrd active name owner response returned a different name hash".to_string(),
+            ));
+        }
+        if result
+            .current_state
+            .owner
+            .as_ref()
+            .map(|owner| (&owner.txid, owner.index))
+            != Some((
+                &result.owner_coin.outpoint.txid,
+                result.owner_coin.outpoint.index,
+            ))
+        {
+            return Err(AppError::Rpc(
+                "hsrd active name owner response has inconsistent owner evidence".to_string(),
+            ));
+        }
+        Ok(result)
+    }
+
+    /// Read proof-backed name evidence under one immutable chain snapshot.
+    pub async fn name_evidence(
+        &self,
+        name_hash: &str,
+        expected_chain_epoch: u64,
+    ) -> Result<NameEvidence, AppError> {
+        validate_hash_hex(name_hash, "hsrd name_hash")?;
+        self.call(
+            "name_evidence",
+            Some(json!({
+                "name_hash": name_hash,
+                "expected_chain_epoch": expected_chain_epoch,
+            })),
+        )
+        .await
+    }
+
+    /// Fetch a retained transaction body under the same chain snapshot used
+    /// by the confirmed wallet scan. `raw_hex == None` is a valid pruned
+    /// result and must not be mistaken for an empty transaction.
+    pub async fn raw_transaction(
+        &self,
+        txid: &str,
+        expected_chain_epoch: u64,
+    ) -> Result<RawTransaction, AppError> {
+        validate_hash_hex(txid, "hsrd txid")?;
+        let result: RawTransaction = self
+            .call(
+                "raw_transaction",
+                Some(json!({
+                    "txid": txid,
+                    "expected_chain_epoch": expected_chain_epoch,
+                })),
+            )
+            .await?;
+        if result.chain_epoch != expected_chain_epoch {
+            return Err(AppError::Rpc(
+                "hsrd raw transaction response changed chain epoch".to_string(),
+            ));
+        }
+        if !result.txid.eq_ignore_ascii_case(txid) {
+            return Err(AppError::Rpc(
+                "hsrd raw transaction response returned a different txid".to_string(),
+            ));
+        }
+        Ok(result)
+    }
+
     /// Fetch one bounded page of confirmed history and UTXOs.
     ///
     /// The cursor is deliberately kept opaque: hsrd owns its encoding and
@@ -228,7 +477,7 @@ impl HsrdRpcClient {
     pub async fn confirmed_scripts_page(
         &self,
         script_ids: &[String],
-        cursor: Option<String>,
+        cursor: Option<Value>,
         limit: usize,
     ) -> Result<ConfirmedScriptsPage, AppError> {
         validate_script_ids(script_ids)?;
@@ -256,9 +505,9 @@ impl HsrdRpcClient {
         &self,
         script_ids: &[String],
         snapshot: &ChainSnapshot,
-    ) -> Result<Vec<ConfirmedScriptUtxo>, AppError> {
+    ) -> Result<ConfirmedScriptsScan, AppError> {
         let mut cursor = None;
-        let mut result = Vec::new();
+        let mut result = ConfirmedScriptsScan::default();
         loop {
             let page = self.confirmed_scripts_page(script_ids, cursor, 256).await?;
             if page.chain_epoch != snapshot.chain_epoch {
@@ -267,7 +516,8 @@ impl HsrdRpcClient {
                         .to_string(),
                 ));
             }
-            result.extend(page.utxos);
+            result.history.extend(page.history);
+            result.utxos.extend(page.utxos);
             cursor = page.continuation;
             if cursor.is_none() {
                 return Ok(result);
@@ -343,6 +593,15 @@ fn validate_script_ids(script_ids: &[String]) -> Result<(), AppError> {
     Ok(())
 }
 
+fn validate_hash_hex(value: &str, label: &str) -> Result<(), AppError> {
+    if value.len() != 64 || !value.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+        return Err(AppError::InvalidInput(format!(
+            "{label} must be a 32-byte hexadecimal string"
+        )));
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -402,10 +661,34 @@ mod tests {
             .await;
         let client = HsrdRpcClient::new(&format!("{}/api/v1/wallet", server.url()), None).unwrap();
         let page = client
-            .confirmed_scripts_page(&[script_id], Some("next".to_string()), 2)
+            .confirmed_scripts_page(&[script_id], Some(Value::String("next".to_string())), 2)
             .await
             .unwrap();
         assert_eq!(page.chain_epoch, 42);
+        mock.assert_async().await;
+    }
+
+    #[tokio::test]
+    async fn active_name_owner_coin_binds_epoch_and_owner_outpoint() {
+        let mut server = Server::new_async().await;
+        let hash = "11".repeat(32);
+        let txid = "22".repeat(32);
+        let mock = server
+            .mock("POST", "/api/v1/wallet")
+            .match_body(Matcher::Regex(
+                r#""method":"active_name_owner_coin".*"expected_chain_epoch":42"#.to_string(),
+            ))
+            .with_status(200)
+            .with_body(format!(
+                r#"{{"result":{{"projection_version":1,"chain_epoch":42,"tip":{{"hash":"aa","height":100,"median_time_past":1,"tree_root":"bb"}},"current_state_hex":"00","current_state":{{"name_hash":"{hash}","name_hex":"616263","height":10,"renewal":20,"owner":{{"txid":"{txid}","index":0}},"value":1,"highest":1,"data_hex":"","transfer":0,"revoked":0,"claimed":0,"renewals":0,"registered":true,"expired":false,"weak":false}},"owner_coin":{{"outpoint":{{"txid":"{txid}","index":0}},"value":1,"height":10,"coinbase":false,"address":{{"version":0,"hash":"{hash20}"}},"covenant":{{"kind":6,"items":[]}}}},"inclusion":{{}},"source_binding":"trusted_node_active_utxo_projection"}}}}"#,
+                hash20 = "33".repeat(20)
+            ))
+            .create_async()
+            .await;
+        let client = HsrdRpcClient::new(&format!("{}/api/v1/wallet", server.url()), None).unwrap();
+        let result = client.active_name_owner_coin(&hash, 42).await.unwrap();
+        assert_eq!(result.current_state.name_hex, "616263");
+        assert_eq!(result.owner_coin.outpoint.txid, txid);
         mock.assert_async().await;
     }
 
@@ -442,8 +725,8 @@ mod tests {
             )
             .await
             .unwrap();
-        assert_eq!(rows.len(), 1);
-        assert_eq!(rows[0].coin.value, 12);
+        assert_eq!(rows.utxos.len(), 1);
+        assert_eq!(rows.utxos[0].coin.value, 12);
         first.assert_async().await;
         second.assert_async().await;
     }
@@ -484,6 +767,33 @@ mod tests {
         assert_eq!(node_coin.value, 42);
         assert_eq!(node_coin.height, Some(7));
         assert!(node_coin.address.unwrap().starts_with("hs1"));
+    }
+
+    #[test]
+    fn accepts_flat_and_nested_history_rows() {
+        let flat: ConfirmedScriptHistory = serde_json::from_value(json!({
+            "txid": "aa".repeat(32),
+            "block_hash": "bb".repeat(32),
+            "height": 7,
+            "transaction_position": 2,
+            "direction": {"received": true, "spent": false}
+        }))
+        .unwrap();
+        assert!(flat.entry.direction.received);
+        let nested: ConfirmedScriptHistory = serde_json::from_value(json!({
+            "script_index": 1,
+            "entry": {
+                "txid": "cc".repeat(32),
+                "block_hash": "dd".repeat(32),
+                "height": 8,
+                "transaction_position": 3,
+                "direction": {"received": false, "spent": true}
+            },
+            "block_time": 123
+        }))
+        .unwrap();
+        assert_eq!(nested.script_index, 1);
+        assert!(nested.entry.direction.spent);
     }
 
     #[tokio::test]

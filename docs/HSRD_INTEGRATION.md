@@ -23,6 +23,12 @@ The current adapter supports the read-only wallet reconciliation path:
 6. Read paginated confirmed UTXOs with `confirmed_scripts_page`.
 7. Convert the response into Namehold's `NodeCoin` model.
 8. Persist the result in `tracked_utxos` and refresh the wallet balance.
+9. Read `active_name_owner_coin` for tracked name-covenant hashes.
+10. Persist current owned-name state when the active owner outpoint matches an
+    unspent wallet name-control UTXO.
+11. Scan every confirmed script-history page, fetch retained transaction bodies
+    with `raw_transaction`, decode Handshake covenants, and persist historical
+    name events in `hsrd_name_history`.
 
 The adapter retries a scan when `hsrd` reports `stale_snapshot` or when the
 chain epoch changes during pagination. A retry discards partial results rather
@@ -32,16 +38,37 @@ than applying a mixed-chain UTXO set.
 
 The following surfaces are intentionally not enabled for `hsrd` yet:
 
-- name discovery and name evidence;
+- historical name events are persisted, but the existing Names view still
+  presents the current owned-name projection rather than an historical event
+  browser;
 - name actions such as renew, reveal, redeem, register, update, and transfer;
 - transaction construction against `hsrd`-specific evidence;
 - transaction broadcast;
 - Shakedex purchases;
 - background synchronization through the legacy `hsd` path.
 
-As a result, a successful `hsrd wallet sync` means that UTXOs were reconciled.
-It does not mean that names or sending are ready. Namehold's existing `hsd`
-engine continues to provide the complete legacy workflow.
+As a result, a successful `hsrd wallet sync` now reconciles owned current-name
+state when the corresponding owner coin is indexed and preserves decoded
+historical covenant events independently of current ownership. A transaction
+body that hsrd has pruned cannot be decoded; the sync reports that condition
+and continues with the remaining evidence. The historical event table is not
+yet wired to the Names view, and sending remains disabled. Namehold's existing
+`hsd` engine continues to provide the complete legacy workflow.
+
+### Pruned historical transaction bodies
+
+`confirmed_scripts_page` can return a complete wallet-index history row even
+when the node no longer retains the serialized transaction. In that case
+`raw_transaction` returns HTTP `410 Gone` with the `payload_pruned` error code.
+This is not a wallet-index or authorization failure: the transaction ID,
+height, block hash, and received/spent metadata remain available, but covenant
+items cannot be decoded from this node. Namehold skips those bodies and reports
+an aggregate count rather than treating the whole synchronization as failed.
+
+To reconstruct historical bids, reveals, renewals, transfers, and other
+covenants, use an hsrd data directory that retains the relevant transaction
+payloads or obtain the raw transactions from another archival source. Merely
+rerunning sync against the same pruned data directory cannot restore them.
 
 ## Requirements
 
@@ -103,6 +130,26 @@ file and passes the correct flags:
 4. Start the node from the Namehold node controls.
 5. Wait for the node status to become reachable.
 6. Press **Sync**.
+
+### Resuming a wallet sync
+
+The **Sync** button scans the wallet-index pages, not the hsrd block
+downloader. Namehold stores each completed page in a profile-scoped checkpoint
+before requesting the next one. If you stop the node, cancel the wallet sync,
+lose network access, or the app/power fails, the next **Sync** resumes from the
+last committed page instead of discarding the scan.
+
+The checkpoint is reused only when the wallet profile, derived-script set, and
+hsrd `chain_epoch` are unchanged. A reorg or another epoch change safely
+discards the incomplete page set and starts a fresh scan for the new chain.
+Already consolidated wallet data is not deleted. The checkpoint is removed
+after the complete scan has been applied successfully.
+
+For maintainers, the checkpoint tables are staging data only; they must not be
+used as the wallet's current UTXO or name projection. A page's rows and its
+continuation token are committed together. The final projection must be
+updated only after the continuation is empty, and cleanup must happen only
+after that projection transaction succeeds.
 
 On mainnet, the process should include arguments equivalent to:
 
@@ -235,9 +282,12 @@ index was built for the same chain.
 
 ### Names do not appear after an `hsrd` sync
 
-This is currently expected. Namehold has not yet connected the `hsrd` name
-evidence methods to the existing name cache. Use `hsd` for the complete names
-workflow until that phase is implemented.
+The first `hsrd` name phase only imports names whose active owner coin is both
+returned by `active_name_owner_coin` and present as an unspent
+`name_control` UTXO in the local wallet cache. Bid lockups and names owned by
+other accounts are deliberately excluded. Historical evidence and names that
+cannot be resolved from the wallet's current indexed owner coins still require
+the `hsd` workflow.
 
 ## Data and security notes
 
@@ -258,10 +308,10 @@ The `hsrd` adapter is read-only with respect to transaction broadcast. Enabling
 The main implementation surfaces are:
 
 - `src-tauri/src/noncustodial/hsrd_rpc.rs`: wallet API v1 client, pagination,
-  epoch validation, script IDs, and coin conversion;
+  epoch validation, script IDs, coin conversion, and name-owner evidence;
 - `src-tauri/src/commands/node.rs`: process lifecycle, authorization file,
   network argument mapping, and diagnostics;
-- `src-tauri/src/commands/sync.rs`: UTXO reconciliation and retry handling;
+- `src-tauri/src/commands/sync.rs`: UTXO/name reconciliation and retry handling;
 - `src-tauri/src/sql/034_node_engine.sql`: persistent engine and hsrd settings.
 
 <!--

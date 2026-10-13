@@ -21,12 +21,17 @@
 
 use crate::db::queries;
 use crate::error::AppError;
-use crate::noncustodial::hsrd_rpc::HsrdRpcClient;
+use crate::noncustodial::hsrd_rpc::{
+    ConfirmedScriptHistory, ConfirmedScriptHistoryDirection, ConfirmedScriptHistoryEntry,
+    ConfirmedScriptUtxo, ConfirmedScriptsScan, HsrdAddress, HsrdCoin, HsrdCovenant, HsrdOutpoint,
+    HsrdRpcClient,
+};
 use crate::noncustodial::network::Network;
 use crate::noncustodial::rpc::{resolve_node_engine, NodeEngine, NodeRpcClient};
 use crate::AppState;
+use rusqlite::OptionalExtension;
 use serde::Serialize;
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::time::Duration;
 use tauri::State;
@@ -464,10 +469,15 @@ pub async fn run_sync_steps(
         if report_progress {
             let mut s = status.lock().await;
             s.step = "node".into();
-            s.progress_label = "Syncing with hsrd wallet API...".into();
+            s.progress_label = "Syncing UTXOs and owned names with hsrd...".into();
         }
-        let synced = sync_node_step(db_path, profile_id).await;
-        if report_progress && !synced {
+        let synced = sync_node_step_with_cancel(db_path, profile_id, Some(status)).await;
+        let cancelled = report_progress && cancel_requested(status).await;
+        if report_progress && cancelled {
+            let mut s = status.lock().await;
+            s.step = "cancelled".into();
+            s.progress_label = "hsrd wallet sync stopped; progress saved".into();
+        } else if report_progress && !synced {
             let mut s = status.lock().await;
             s.step = "error".into();
             s.progress_label = "hsrd wallet sync failed".into();
@@ -478,7 +488,7 @@ pub async fn run_sync_steps(
         } else if report_progress {
             let mut s = status.lock().await;
             s.step = "done".into();
-            s.progress_label = "hsrd wallet sync complete".into();
+            s.progress_label = "hsrd wallet and name sync complete".into();
         }
         return;
     }
@@ -677,6 +687,14 @@ fn apply_node_sync_batch(
 }
 
 pub async fn sync_node_step(db_path: &str, profile_id: &str) -> bool {
+    sync_node_step_with_cancel(db_path, profile_id, None).await
+}
+
+async fn sync_node_step_with_cancel(
+    db_path: &str,
+    profile_id: &str,
+    status: Option<&Arc<Mutex<SyncStatus>>>,
+) -> bool {
     let conn = match open_conn(db_path) {
         Ok(c) => c,
         Err(_) => return false,
@@ -718,7 +736,8 @@ pub async fn sync_node_step(db_path: &str, profile_id: &str) -> bool {
             Err(_) => return false,
         };
         drop(conn);
-        return sync_hsrd_node_step(db_path, profile_id, &settings, network, &scripts).await;
+        return sync_hsrd_node_step(db_path, profile_id, &settings, network, &scripts, status)
+            .await;
     }
     drop(conn);
 
@@ -747,6 +766,7 @@ async fn sync_hsrd_node_step(
     settings: &std::collections::HashMap<String, String>,
     network: Network,
     scripts: &[String],
+    status: Option<&Arc<Mutex<SyncStatus>>>,
 ) -> bool {
     let client = match HsrdRpcClient::from_settings(settings) {
         Ok(client) => client,
@@ -776,50 +796,71 @@ async fn sync_hsrd_node_step(
     script_ids.sort();
     script_ids.dedup();
 
-    let (snapshot, confirmed) = {
-        let mut last_error = None;
-        let mut result = None;
-        for attempt in 0..3 {
-            let snapshot = match client.chain_snapshot().await {
-                Ok(snapshot) => snapshot,
-                Err(error) => {
-                    let retryable = error.to_string().contains("stale_snapshot");
-                    last_error = Some(error);
-                    if retryable && attempt < 2 {
-                        sleep(Duration::from_millis(250)).await;
-                        continue;
-                    }
-                    break;
-                }
-            };
-            match client.confirmed_scripts_all(&script_ids, &snapshot).await {
-                Ok(coins) => {
-                    result = Some((snapshot, coins));
-                    break;
-                }
-                Err(error) if error.to_string().contains("chain changed during") && attempt < 2 => {
-                    last_error = Some(error);
-                    sleep(Duration::from_millis(250)).await;
-                }
-                Err(error) => {
-                    last_error = Some(error);
-                    break;
-                }
-            }
-        }
-        match result {
-            Some(result) => result,
-            None => {
-                eprintln!(
-                    "hsrd wallet sync: chain snapshot/scan failed after retries: {}",
-                    last_error
-                        .map(|error| error.to_string())
-                        .unwrap_or_else(|| "unknown error".to_string())
-                );
-                return false;
-            }
+    let snapshot = match client.chain_snapshot().await {
+        Ok(snapshot) => snapshot,
+        Err(error) => {
+            eprintln!("hsrd wallet sync: cannot get chain snapshot: {error}");
+            return false;
         }
     };
+    // The checkpoint is bound to this immutable snapshot and to the exact
+    // wallet script set. A changed epoch or script set invalidates staged
+    // rows before a new scan begins.
+    let fingerprint = hsrd_script_fingerprint(&script_ids);
+    let continuation =
+        match prepare_hsrd_checkpoint(db_path, profile_id, snapshot.chain_epoch, &fingerprint) {
+            Ok(cursor) => cursor,
+            Err(error) => {
+                eprintln!("hsrd wallet sync: cannot prepare checkpoint: {error}");
+                return false;
+            }
+        };
+    let mut cursor = continuation;
+    loop {
+        if let Some(status) = status {
+            if cancel_requested(status).await {
+                // The previous page was committed before this check, so the
+                // next run can safely resume with the stored continuation.
+                return true;
+            }
+        }
+        let page = match client
+            .confirmed_scripts_page(&script_ids, cursor.clone(), 256)
+            .await
+        {
+            Ok(page) => page,
+            Err(error) => {
+                eprintln!("hsrd wallet sync: page scan stopped; checkpoint kept: {error}");
+                return false;
+            }
+        };
+        if page.chain_epoch != snapshot.chain_epoch {
+            // Never mix pages from different chain epochs. Keeping the old
+            // checkpoint lets prepare_hsrd_checkpoint discard it atomically on
+            // the next run without touching already consolidated wallet data.
+            eprintln!("hsrd wallet sync: chain changed; checkpoint will restart on the next run");
+            return false;
+        }
+        // Persist the page and its continuation together. This is the durable
+        // boundary used for recovery after a network, process, or power loss.
+        if let Err(error) = persist_hsrd_page(db_path, profile_id, &page) {
+            eprintln!("hsrd wallet sync: cannot persist page checkpoint: {error}");
+            return false;
+        }
+        cursor = page.continuation;
+        if cursor.is_none() {
+            break;
+        }
+    }
+    let confirmed = match load_hsrd_checkpoint_scan(db_path, profile_id) {
+        Ok(scan) => scan,
+        Err(error) => {
+            eprintln!("hsrd wallet sync: cannot load checkpoint: {error}");
+            return false;
+        }
+    };
+    // Only a complete scan reaches this point. Applying the result now keeps
+    // spent reconciliation from treating an incomplete page set as truth.
     let height = match snapshot
         .tip
         .as_ref()
@@ -829,6 +870,7 @@ async fn sync_hsrd_node_step(
         None => return false,
     };
     let coins = confirmed
+        .utxos
         .iter()
         .map(|coin| coin.coin.to_node_coin(network))
         .collect::<Result<Vec<_>, _>>();
@@ -848,12 +890,558 @@ async fn sync_hsrd_node_step(
         }
     };
     match apply_node_sync_batch(&mut conn, profile_id, &coins, height) {
-        Ok(()) => true,
+        Ok(()) => {
+            drop(conn);
+            if let Err(error) = clear_hsrd_checkpoint(db_path, profile_id) {
+                eprintln!("hsrd wallet sync: completed but could not clear checkpoint: {error}");
+            }
+            sync_hsrd_history(
+                db_path,
+                profile_id,
+                client.clone(),
+                snapshot.chain_epoch,
+                confirmed.history,
+            )
+            .await;
+            sync_hsrd_names(db_path, profile_id, &client, snapshot.chain_epoch).await;
+            return true;
+        }
+
         Err(error) => {
             eprintln!("hsrd wallet sync: cannot apply UTXOs: {error}");
-            false
+            return false;
         }
     }
+
+    fn hsrd_script_fingerprint(script_ids: &[String]) -> String {
+        let mut bytes = Vec::new();
+        for script in script_ids {
+            bytes.extend_from_slice(script.as_bytes());
+            bytes.push(0);
+        }
+        hex::encode(crate::noncustodial::tx::blake2b256(&bytes))
+    }
+
+    /// Return the saved opaque hsrd cursor when it matches the current scan
+    /// identity, otherwise clear the staged page set and create a fresh scan.
+    fn prepare_hsrd_checkpoint(
+        db_path: &str,
+        profile_id: &str,
+        chain_epoch: u64,
+        script_fingerprint: &str,
+    ) -> Result<Option<serde_json::Value>, AppError> {
+        let conn = open_conn(db_path)?;
+        let existing: Option<(i64, String, Option<String>)> = conn
+            .query_row(
+                "SELECT chain_epoch, script_fingerprint, continuation_json
+                 FROM hsrd_sync_checkpoints WHERE wallet_profile_id = ?1",
+                [profile_id],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .optional()?;
+        if existing.as_ref().is_some_and(|(epoch, fingerprint, _)| {
+            *epoch == chain_epoch as i64 && fingerprint == script_fingerprint
+        }) {
+            return existing
+                .and_then(|(_, _, cursor)| cursor)
+                .map(|cursor| {
+                    serde_json::from_str::<serde_json::Value>(&cursor).map_err(AppError::Json)
+                })
+                .transpose();
+        }
+        let tx = conn.unchecked_transaction()?;
+        tx.execute(
+            "DELETE FROM hsrd_sync_checkpoint_utxos WHERE wallet_profile_id = ?1",
+            [profile_id],
+        )?;
+        tx.execute(
+            "DELETE FROM hsrd_sync_checkpoint_history WHERE wallet_profile_id = ?1",
+            [profile_id],
+        )?;
+        tx.execute(
+            "INSERT INTO hsrd_sync_checkpoints
+                 (wallet_profile_id, chain_epoch, script_fingerprint, continuation_json)
+             VALUES (?1, ?2, ?3, NULL)
+             ON CONFLICT(wallet_profile_id) DO UPDATE SET
+                 chain_epoch = excluded.chain_epoch,
+                 script_fingerprint = excluded.script_fingerprint,
+                 continuation_json = NULL,
+                 updated_at = datetime('now')",
+            rusqlite::params![profile_id, chain_epoch as i64, script_fingerprint],
+        )?;
+        tx.commit()?;
+        Ok(None)
+    }
+
+    /// Atomically append one hsrd page and advance its durable continuation.
+    fn persist_hsrd_page(
+        db_path: &str,
+        profile_id: &str,
+        page: &crate::noncustodial::hsrd_rpc::ConfirmedScriptsPage,
+    ) -> Result<(), AppError> {
+        let conn = open_conn(db_path)?;
+        let tx = conn.unchecked_transaction()?;
+        for item in &page.utxos {
+            tx.execute(
+                "INSERT OR REPLACE INTO hsrd_sync_checkpoint_utxos
+                 (wallet_profile_id, txid, vout, script_index, value_doos, height,
+                  coinbase, address_version, address_hash, covenant_kind, covenant_items_json)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
+                rusqlite::params![
+                    profile_id,
+                    item.coin.outpoint.txid,
+                    item.coin.outpoint.index,
+                    item.script_index as i64,
+                    item.coin.value as i64,
+                    item.coin.height as i64,
+                    item.coin.coinbase as i64,
+                    item.coin.address.version as i64,
+                    item.coin.address.hash,
+                    item.coin.covenant.kind as i64,
+                    serde_json::to_string(&item.coin.covenant.items)?,
+                ],
+            )?;
+        }
+        for item in &page.history {
+            tx.execute(
+                "INSERT OR REPLACE INTO hsrd_sync_checkpoint_history
+                 (wallet_profile_id, script_index, txid, block_hash, height,
+                  transaction_position, received, spent, block_time)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+                rusqlite::params![
+                    profile_id,
+                    item.script_index as i64,
+                    item.entry.txid,
+                    item.entry.block_hash,
+                    item.entry.height as i64,
+                    item.entry.transaction_position as i64,
+                    item.entry.direction.received as i64,
+                    item.entry.direction.spent as i64,
+                    item.block_time.map(|value| value as i64),
+                ],
+            )?;
+        }
+        let continuation_json = page
+            .continuation
+            .as_ref()
+            .map(serde_json::to_string)
+            .transpose()?;
+        tx.execute(
+            "UPDATE hsrd_sync_checkpoints
+             SET continuation_json = ?2, updated_at = datetime('now')
+             WHERE wallet_profile_id = ?1",
+            rusqlite::params![profile_id, continuation_json],
+        )?;
+        tx.commit()?;
+        Ok(())
+    }
+
+    /// Reconstruct the complete staged scan after the final page was committed.
+    fn load_hsrd_checkpoint_scan(
+        db_path: &str,
+        profile_id: &str,
+    ) -> Result<ConfirmedScriptsScan, AppError> {
+        let conn = open_conn(db_path)?;
+        let mut utxos = Vec::new();
+        let mut statement = conn.prepare(
+            "SELECT script_index, txid, vout, value_doos, height, coinbase,
+                    address_version, address_hash, covenant_kind, covenant_items_json
+             FROM hsrd_sync_checkpoint_utxos
+             WHERE wallet_profile_id = ?1",
+        )?;
+        let rows = statement.query_map([profile_id], |row| {
+            let items_json: String = row.get(9)?;
+            let items = serde_json::from_str(&items_json).map_err(|error| {
+                rusqlite::Error::FromSqlConversionFailure(
+                    9,
+                    rusqlite::types::Type::Text,
+                    Box::new(error),
+                )
+            })?;
+            Ok(ConfirmedScriptUtxo {
+                script_index: row.get::<_, i64>(0)? as usize,
+                coin: HsrdCoin {
+                    outpoint: HsrdOutpoint {
+                        txid: row.get(1)?,
+                        index: row.get::<_, i64>(2)? as u32,
+                    },
+                    value: row.get::<_, i64>(3)? as u64,
+                    height: row.get::<_, i64>(4)? as u32,
+                    coinbase: row.get::<_, i64>(5)? != 0,
+                    address: HsrdAddress {
+                        version: row.get::<_, i64>(6)? as u8,
+                        hash: row.get(7)?,
+                    },
+                    covenant: HsrdCovenant {
+                        kind: row.get::<_, i64>(8)? as u8,
+                        items,
+                    },
+                },
+            })
+        })?;
+        for row in rows {
+            utxos.push(row?);
+        }
+
+        let mut history = Vec::new();
+        let mut statement = conn.prepare(
+            "SELECT script_index, txid, block_hash, height, transaction_position,
+                    received, spent, block_time
+             FROM hsrd_sync_checkpoint_history
+             WHERE wallet_profile_id = ?1",
+        )?;
+        let rows = statement.query_map([profile_id], |row| {
+            Ok(ConfirmedScriptHistory {
+                script_index: row.get::<_, i64>(0)? as usize,
+                entry: ConfirmedScriptHistoryEntry {
+                    txid: row.get(1)?,
+                    block_hash: row.get(2)?,
+                    height: row.get::<_, i64>(3)? as u32,
+                    transaction_position: row.get::<_, i64>(4)? as u32,
+                    direction: ConfirmedScriptHistoryDirection {
+                        received: row.get::<_, i64>(5)? != 0,
+                        spent: row.get::<_, i64>(6)? != 0,
+                    },
+                },
+                block_time: row.get::<_, Option<i64>>(7)?.map(|value| value as u64),
+            })
+        })?;
+        for row in rows {
+            history.push(row?);
+        }
+        Ok(ConfirmedScriptsScan { history, utxos })
+    }
+
+    /// Remove staging rows after the final wallet projection has been committed.
+    fn clear_hsrd_checkpoint(db_path: &str, profile_id: &str) -> Result<(), AppError> {
+        let conn = open_conn(db_path)?;
+        let tx = conn.unchecked_transaction()?;
+        tx.execute(
+            "DELETE FROM hsrd_sync_checkpoint_utxos WHERE wallet_profile_id = ?1",
+            [profile_id],
+        )?;
+        tx.execute(
+            "DELETE FROM hsrd_sync_checkpoint_history WHERE wallet_profile_id = ?1",
+            [profile_id],
+        )?;
+        tx.execute(
+            "DELETE FROM hsrd_sync_checkpoints WHERE wallet_profile_id = ?1",
+            [profile_id],
+        )?;
+        tx.commit()?;
+        Ok(())
+    }
+}
+
+/// Fetch and persist the transaction bodies referenced by hsrd's confirmed
+/// script history. The index rows contain txids and direction, while covenant
+/// details live in the retained raw transaction.
+async fn sync_hsrd_history(
+    db_path: &str,
+    profile_id: &str,
+    client: HsrdRpcClient,
+    chain_epoch: u64,
+    history: Vec<crate::noncustodial::hsrd_rpc::ConfirmedScriptHistory>,
+) {
+    let mut directions = HashMap::new();
+    for row in history {
+        let direction = match (row.entry.direction.received, row.entry.direction.spent) {
+            (true, true) => "received+spent",
+            (true, false) => "received",
+            (false, true) => "spent",
+            (false, false) => "unknown",
+        }
+        .to_string();
+        directions
+            .entry(row.entry.txid)
+            .or_insert((direction, row.entry.height));
+    }
+    if directions.is_empty() {
+        return;
+    }
+    let history_transaction_count = directions.len();
+    let mut transactions = Vec::new();
+    let mut pruned_transactions = 0usize;
+    for (txid, (direction, height)) in directions {
+        let raw = match client.raw_transaction(&txid, chain_epoch).await {
+            Ok(raw) => raw,
+            Err(error) => {
+                if error.to_string().contains("payload_pruned") {
+                    pruned_transactions += 1;
+                } else {
+                    eprintln!("hsrd history: cannot fetch {txid}: {error}");
+                }
+                continue;
+            }
+        };
+        let Some(raw_hex) = raw.raw_hex else {
+            eprintln!("hsrd history: transaction {txid} is pruned");
+            continue;
+        };
+        let bytes = match hex::decode(&raw_hex) {
+            Ok(bytes) => bytes,
+            Err(error) => {
+                eprintln!("hsrd history: invalid raw hex for {txid}: {error}");
+                continue;
+            }
+        };
+        let transaction = match crate::noncustodial::tx::Transaction::decode(&bytes) {
+            Ok(transaction) if transaction.txid().eq_ignore_ascii_case(&txid) => transaction,
+            Ok(_) => {
+                eprintln!("hsrd history: decoded transaction id mismatch for {txid}");
+                continue;
+            }
+            Err(error) => {
+                eprintln!("hsrd history: cannot decode {txid}: {error}");
+                continue;
+            }
+        };
+        transactions.push((txid, direction, height, raw_hex, transaction));
+    }
+    let mut conn = match open_conn(db_path) {
+        Ok(conn) => conn,
+        Err(error) => {
+            eprintln!("hsrd history: cannot open database: {error}");
+            return;
+        }
+    };
+    let tx = match conn.transaction() {
+        Ok(tx) => tx,
+        Err(error) => {
+            eprintln!("hsrd history: cannot start database transaction: {error}");
+            return;
+        }
+    };
+    let mut events = 0usize;
+    for (txid, direction, height, raw_hex, transaction) in transactions {
+        let raw_json =
+            serde_json::json!({"hsrd": true, "txid": txid, "rawHex": raw_hex}).to_string();
+        if let Err(error) = crate::noncustodial::sync::cache_transaction(
+            &tx,
+            profile_id,
+            &txid,
+            Some(i64::from(height)),
+            None,
+            &raw_json,
+        ) {
+            eprintln!("hsrd history: cannot cache {txid}: {error}");
+            return;
+        }
+        for (vout, output) in transaction.outputs.iter().enumerate() {
+            let kind = output.covenant.covenant_type;
+            if kind == crate::noncustodial::sync::COV_NONE
+                || output.covenant.items.first().map(Vec::len) != Some(32)
+            {
+                continue;
+            }
+            let name_hash = hex::encode(output.covenant.items[0].as_slice());
+            let name = [2usize, 6usize]
+                .iter()
+                .find_map(|index| output.covenant.items.get(*index))
+                .and_then(|item| String::from_utf8(item.clone()).ok())
+                .filter(|name| crate::noncustodial::names::verify_name(name));
+            let covenant_json = serde_json::json!({
+                "type": kind,
+                "items": output.covenant.items.iter().map(hex::encode).collect::<Vec<_>>(),
+            })
+            .to_string();
+            if let Err(error) = tx.execute(
+                "INSERT INTO hsrd_name_history
+                    (wallet_profile_id, txid, vout, name_hash_hex, name,
+                     covenant_type, value_doos, height, direction, covenant_json)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)
+                 ON CONFLICT(wallet_profile_id, txid, vout) DO UPDATE SET
+                    name_hash_hex = excluded.name_hash_hex, name = excluded.name,
+                    covenant_type = excluded.covenant_type, value_doos = excluded.value_doos,
+                    height = excluded.height, direction = excluded.direction,
+                    covenant_json = excluded.covenant_json",
+                rusqlite::params![
+                    profile_id,
+                    txid,
+                    vout as i64,
+                    name_hash,
+                    name,
+                    kind as i64,
+                    i64::try_from(output.value).unwrap_or(i64::MAX),
+                    Some(i64::from(height)),
+                    direction,
+                    covenant_json,
+                ],
+            ) {
+                eprintln!("hsrd history: cannot persist {txid}:{vout}: {error}");
+                return;
+            }
+            events += 1;
+        }
+    }
+    if let Err(error) = tx.commit() {
+        eprintln!("hsrd history: cannot commit transaction history: {error}");
+        return;
+    }
+    if pruned_transactions > 0 {
+        eprintln!(
+            "hsrd history: {pruned_transactions} transaction bodies were pruned; \
+             their historical covenant events cannot be reconstructed from this node"
+        );
+    }
+    eprintln!(
+        "hsrd history: inspected {} transactions and persisted {events} name covenant events",
+        history_transaction_count
+    );
+}
+
+/// Reconcile current hsrd NameState projections for name-covenant UTXOs that
+/// are still owned by this profile. The owner coin is checked against the
+/// already-applied live UTXO set, so bid lockups cannot appear as owned names.
+async fn sync_hsrd_names(
+    db_path: &str,
+    profile_id: &str,
+    client: &HsrdRpcClient,
+    chain_epoch: u64,
+) {
+    let conn = match open_conn(db_path) {
+        Ok(conn) => conn,
+        Err(error) => {
+            eprintln!("hsrd name sync: cannot open database: {error}");
+            return;
+        }
+    };
+    let hashes = match queries::list_unspent_wallet_name_hashes(&conn, profile_id) {
+        Ok(hashes) => hashes,
+        Err(error) => {
+            eprintln!("hsrd name sync: cannot list wallet name hashes: {error}");
+            return;
+        }
+    };
+    let owned_outpoints: HashSet<(String, u32)> = match conn
+        .prepare(
+            "SELECT txid, vout FROM tracked_utxos
+                 WHERE wallet_profile_id = ?1
+                   AND spent_by_txid IS NULL
+                   AND spend_class = 'name_control'",
+        )
+        .and_then(|mut statement| {
+            statement
+                .query_map(rusqlite::params![profile_id], |row| {
+                    Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)? as u32))
+                })
+                .and_then(|rows| rows.collect::<Result<HashSet<_>, _>>())
+        }) {
+        Ok(outpoints) => outpoints,
+        Err(error) => {
+            eprintln!("hsrd name sync: cannot read owner UTXOs: {error}");
+            return;
+        }
+    };
+    drop(conn);
+
+    if hashes.is_empty() {
+        return;
+    }
+
+    let mut states = Vec::new();
+    for hash in hashes {
+        let owner = match client
+            .active_name_owner_coin(&hash.name_hash_hex, chain_epoch)
+            .await
+        {
+            Ok(owner) => owner,
+            Err(error) => {
+                eprintln!("hsrd name sync: skipping {}: {error}", hash.name_hash_hex);
+                continue;
+            }
+        };
+        let Some(active_owner) = owner.current_state.owner.as_ref() else {
+            continue;
+        };
+        if !owned_outpoints.contains(&(active_owner.txid.clone(), active_owner.index)) {
+            continue;
+        }
+        let name = match hex::decode(&owner.current_state.name_hex)
+            .ok()
+            .and_then(|bytes| String::from_utf8(bytes).ok())
+        {
+            Some(name) if crate::noncustodial::names::verify_name(&name) => name,
+            _ => {
+                eprintln!(
+                    "hsrd name sync: skipping {} with invalid name_hex",
+                    hash.name_hash_hex
+                );
+                continue;
+            }
+        };
+        if !owner
+            .current_state
+            .name_hash
+            .eq_ignore_ascii_case(&hash.name_hash_hex)
+        {
+            eprintln!(
+                "hsrd name sync: skipping {} because NameState hash does not match",
+                name
+            );
+            continue;
+        }
+        let info = serde_json::json!({
+            "info": {
+                "name": name,
+                "nameHash": owner.current_state.name_hash,
+                "state": if owner.current_state.registered { "CLOSED" } else { "UNKNOWN" },
+                "height": owner.current_state.height,
+                "renewal": owner.current_state.renewal,
+                "owner": {
+                    "hash": active_owner.txid,
+                    "index": active_owner.index
+                },
+                "value": owner.current_state.value,
+                "highest": owner.current_state.highest,
+                "transfer": owner.current_state.transfer,
+                "revoked": owner.current_state.revoked > 0,
+                "claimed": owner.current_state.claimed,
+                "renewals": owner.current_state.renewals,
+                "registered": owner.current_state.registered,
+                "expired": owner.current_state.expired,
+                "weak": owner.current_state.weak,
+                "hsrd": {
+                    "projectionVersion": owner.projection_version,
+                    "chainEpoch": owner.chain_epoch,
+                    "sourceBinding": owner.source_binding,
+                    "currentStateHex": owner.current_state_hex
+                }
+            }
+        });
+        states.push((name, info));
+    }
+
+    if states.is_empty() {
+        return;
+    }
+    let mut conn = match open_conn(db_path) {
+        Ok(conn) => conn,
+        Err(error) => {
+            eprintln!("hsrd name sync: cannot reopen database: {error}");
+            return;
+        }
+    };
+    let tx = match conn.transaction() {
+        Ok(tx) => tx,
+        Err(error) => {
+            eprintln!("hsrd name sync: cannot start database transaction: {error}");
+            return;
+        }
+    };
+    for (name, info) in &states {
+        if let Err(error) =
+            crate::noncustodial::sync::upsert_name_state(&tx, profile_id, name, info)
+        {
+            eprintln!("hsrd name sync: cannot persist {name}: {error}");
+            return;
+        }
+    }
+    if let Err(error) = tx.commit() {
+        eprintln!("hsrd name sync: cannot commit names: {error}");
+        return;
+    }
+    eprintln!("hsrd name sync: reconciled {} owned names", states.len());
 }
 
 /// Client-injected coin-fetch phase for [`sync_node_step`], with the

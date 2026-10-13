@@ -56,6 +56,8 @@ const MIGRATIONS: &[(&str, &str)] = &[
     ),
     ("033", include_str!("../sql/033_shakedex.sql")),
     ("034", include_str!("../sql/034_node_engine.sql")),
+    ("035", include_str!("../sql/035_hsrd_name_history.sql")),
+    ("036", include_str!("../sql/036_hsrd_sync_checkpoint.sql")),
 ];
 
 pub fn run(conn: &Connection) -> Result<(), rusqlite::Error> {
@@ -97,7 +99,7 @@ mod tests {
         let count: i64 = conn
             .query_row("SELECT COUNT(*) FROM schema_version", [], |row| row.get(0))
             .unwrap();
-        assert_eq!(count, 34, "expected 34 migrations, got {count}");
+        assert_eq!(count, 36, "expected 36 migrations, got {count}");
     }
 
     #[test]
@@ -108,7 +110,7 @@ mod tests {
         let count: i64 = conn
             .query_row("SELECT COUNT(*) FROM schema_version", [], |row| row.get(0))
             .unwrap();
-        assert_eq!(count, 34);
+        assert_eq!(count, 36);
     }
 
     #[test]

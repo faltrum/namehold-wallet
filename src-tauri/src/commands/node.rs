@@ -764,6 +764,7 @@ pub async fn start_hsd(state: State<'_, AppState>) -> Result<serde_json::Value, 
         cmd.arg("--network").arg(hsrd_network);
         cmd.arg("--data-dir").arg(&data_dir);
         cmd.arg("--rpc-bind").arg("127.0.0.1:12037");
+        cmd.arg("--storage-mode").arg("archive");
         cmd.arg("--wallet-index");
         if !hsrd_authorization.trim().is_empty() {
             let auth_path = std::path::Path::new(&data_dir).join("namehold-hsrd.authorization");
